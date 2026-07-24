@@ -70,6 +70,8 @@ pwd: std.ArrayList(u8),
 
 terminal_unit_next_id: u64 = 1,
 terminal_unit_open_id: ?u64 = null,
+terminal_unit_boundary_pending: bool = false,
+terminal_unit_prompt_boundary_rows: u8 = 0,
 
 /// The title of the terminal as set by escape sequences (e.g. OSC 0/2).
 title: std.ArrayList(u8),
@@ -1759,6 +1761,15 @@ pub fn semanticPrompt(
             try self.semanticPromptFreshLine();
 
             const screen: *Screen = self.screens.active;
+            if (self.screens.active_key == .primary and
+                self.terminal_unit_boundary_pending)
+            {
+                // Preserve the fresh blank row as renderer-owned breathing
+                // room instead of letting the next prompt overwrite it.
+                try self.index();
+                self.terminal_unit_boundary_pending = false;
+                self.terminal_unit_prompt_boundary_rows = 1;
+            }
 
             // "Subsequent text (until a OSC "133;B" or OSC "133;I" command)
             // is a prompt string (as if followed by OSC 133;P;k=i\007)."
@@ -3805,6 +3816,7 @@ pub const TerminalUnit = struct {
     output: TerminalUnitRange,
     lifecycle: TerminalUnitLifecycle,
     command_start_pwd: ?[]u8,
+    leading_boundary_rows: u8,
 };
 
 const TerminalUnitRanges = struct {
@@ -3874,6 +3886,7 @@ fn closeOpenTerminalUnitUnknown(self: *Terminal) void {
     const data = page.terminalUnitDataMut(prompt.rowAndCell().row) orelse return;
     if (data.lifecycle == .open) {
         data.lifecycle = .closed_unknown;
+        self.terminal_unit_boundary_pending = true;
         self.advanceTerminalUnitActivity();
     }
 }
@@ -3903,6 +3916,8 @@ fn startTerminalUnit(self: *Terminal) void {
         unit_id,
         self.getPwd(),
     ) catch return;
+    const data = prompt_page.terminalUnitDataMut(prompt_row) orelse return;
+    data.leading_boundary_rows = self.terminal_unit_prompt_boundary_rows;
     self.terminal_unit_open_id = unit_id;
     self.advanceTerminalUnitActivity();
 }
@@ -3915,6 +3930,7 @@ fn finishTerminalUnit(self: *Terminal, exit_status: ?i32) void {
     const data = page.terminalUnitDataMut(prompt.rowAndCell().row) orelse return;
     if (exit_status == null) {
         data.lifecycle = .closed_unknown;
+        self.terminal_unit_boundary_pending = true;
         self.advanceTerminalUnitActivity();
         return;
     }
@@ -3924,6 +3940,7 @@ fn finishTerminalUnit(self: *Terminal, exit_status: ?i32) void {
         null;
     data.exit_status = exit_status.?;
     data.lifecycle = .closed;
+    self.terminal_unit_boundary_pending = true;
     self.advanceTerminalUnitActivity();
 }
 
@@ -4065,6 +4082,7 @@ pub fn terminalUnitSnapshot(
             .output = ranges.output,
             .lifecycle = terminalUnitLifecycle(data),
             .command_start_pwd = pwd_copy,
+            .leading_boundary_rows = data.leading_boundary_rows,
         });
     }
 
@@ -4307,6 +4325,8 @@ test "terminal-unit boundary reserves a blank row before the next prompt" {
     try testing.expectEqual(@as(usize, 2), snapshot.units.len);
     const first = snapshot.units[0];
     const second = snapshot.units[1];
+    try testing.expectEqual(@as(u8, 0), first.leading_boundary_rows);
+    try testing.expectEqual(@as(u8, 1), second.leading_boundary_rows);
     try testing.expect(first.output.present);
     try testing.expectEqual(
         first.output.end_row + 2,
@@ -5050,6 +5070,8 @@ pub fn fullReset(self: *Terminal) void {
     // Reset our screens
     self.screens.active.reset();
     self.terminal_unit_open_id = null;
+    self.terminal_unit_boundary_pending = false;
+    self.terminal_unit_prompt_boundary_rows = 0;
 
     // Rest our basic state
     self.modes.reset();

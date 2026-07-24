@@ -1887,7 +1887,9 @@ pub const CAPI = struct {
         duration_ns: u64 = 0,
         command_start_pwd: ?[*]const u8 = null,
         command_start_pwd_len: usize = 0,
-        reserved: [4]u64 = @splat(0),
+        leading_boundary_rows: u8 = 0,
+        reserved1: [7]u8 = @splat(0),
+        reserved: [3]u64 = @splat(0),
     };
 
     const TerminalUnitSnapshot = extern struct {
@@ -2956,6 +2958,7 @@ pub const CAPI = struct {
                         pwd_.len
                     else
                         0,
+                    .leading_boundary_rows = unit.leading_boundary_rows,
                 };
             }
             out.units = units;

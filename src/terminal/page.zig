@@ -127,6 +127,7 @@ pub const TerminalUnitData = struct {
     duration_ns: ?u64 = null,
     exit_status: i32 = 0,
     pwd: ?Offset(u8).Slice = null,
+    leading_boundary_rows: u8 = 0,
     lifecycle: enum(u8) {
         open = 0,
         closed = 1,

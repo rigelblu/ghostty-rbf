@@ -664,7 +664,9 @@ typedef struct {
   uint64_t duration_ns;
   const char* command_start_pwd;
   size_t command_start_pwd_len;
-  uint64_t reserved[4];
+  uint8_t leading_boundary_rows;
+  uint8_t reserved1[7];
+  uint64_t reserved[3];
 } ghostty_terminal_unit_s;
 
 // Callers must initialize `struct_size` before snapshot/read/free calls.
