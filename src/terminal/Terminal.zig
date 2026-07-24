@@ -4279,6 +4279,49 @@ test "terminal-unit snapshot captures semantic ranges lifecycle and command-star
     try testing.expectEqualStrings("\nhi\n", text.output.?);
 }
 
+test "terminal-unit boundary reserves a blank row before the next prompt" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 40, .rows = 12 });
+    defer t.deinit(alloc);
+
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("echo one");
+    try t.semanticPrompt(.init(.end_input_start_output));
+    try t.printString("\none\n");
+    try t.semanticPrompt(.{
+        .action = .end_command,
+        .options_unvalidated = "0",
+    });
+
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("echo two");
+    try t.semanticPrompt(.init(.end_input_start_output));
+
+    var snapshot = try t.terminalUnitSnapshot(alloc, 0, 12, 8);
+    defer snapshot.deinit(alloc);
+
+    try testing.expectEqual(@as(usize, 2), snapshot.units.len);
+    const first = snapshot.units[0];
+    const second = snapshot.units[1];
+    try testing.expect(first.output.present);
+    try testing.expectEqual(
+        first.output.end_row + 2,
+        second.prompt.start_row,
+    );
+
+    const boundary_row = t.screens.active.pages.pin(.{
+        .screen = .{ .y = @intCast(first.output.end_row + 1) },
+    }) orelse return error.TestUnexpectedResult;
+    const boundary_page = boundary_row.node.page();
+    for (boundary_page.getCells(boundary_row.rowAndCell().row)) |cell| {
+        try testing.expect(cell.isEmpty());
+    }
+}
+
 test "terminal-unit output text preserves leading and trailing hard newlines" {
     const alloc = testing.allocator;
 
