@@ -348,6 +348,10 @@ pub const Action = union(Key) {
     /// through the normal surface APIs. This carries no payload.
     selection_changed,
 
+    /// Called when semantic terminal-unit boundaries, completion metadata, or
+    /// absolute row-space identity changes. Carries no borrowed payload.
+    terminal_units_changed,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -416,6 +420,7 @@ pub const Action = union(Key) {
         readonly,
         copy_title_to_clipboard,
         selection_changed,
+        terminal_units_changed,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -429,6 +434,10 @@ pub const Action = union(Key) {
             try std.testing.expectEqual(
                 @as(c_int, 65),
                 @intFromEnum(Key.selection_changed),
+            );
+            try std.testing.expectEqual(
+                @as(c_int, 66),
+                @intFromEnum(Key.terminal_units_changed),
             );
         }
     };

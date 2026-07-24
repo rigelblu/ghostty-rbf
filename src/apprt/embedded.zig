@@ -1848,6 +1848,168 @@ pub const CAPI = struct {
         row_space_revision: u64,
     };
 
+    const TerminalUnitResult = enum(c_int) {
+        ok = 0,
+        stale_revision = 1,
+        invalid_unit = 2,
+        not_closed = 3,
+        not_retained = 4,
+        out_of_memory = 5,
+        invalid_window = 6,
+    };
+
+    const TerminalUnitLifecycle = enum(c_int) {
+        open = 0,
+        closed = 1,
+        closed_unknown = 2,
+    };
+
+    const TerminalUnitRange = extern struct {
+        struct_size: usize = @sizeOf(TerminalUnitRange),
+        start_row: u64 = 0,
+        end_row: u64 = 0,
+        start_column: u32 = 0,
+        end_column: u32 = 0,
+        present: bool = false,
+        reserved: [7]u8 = @splat(0),
+    };
+
+    const TerminalUnit = extern struct {
+        struct_size: usize = @sizeOf(TerminalUnit),
+        unit_id: u64 = 0,
+        prompt: TerminalUnitRange = .{},
+        command: TerminalUnitRange = .{},
+        output: TerminalUnitRange = .{},
+        lifecycle: TerminalUnitLifecycle = .open,
+        exit_status: i32 = 0,
+        has_duration: bool = false,
+        reserved0: [7]u8 = @splat(0),
+        duration_ns: u64 = 0,
+        command_start_pwd: ?[*]const u8 = null,
+        command_start_pwd_len: usize = 0,
+        reserved: [4]u64 = @splat(0),
+    };
+
+    const TerminalUnitSnapshot = extern struct {
+        struct_size: usize = @sizeOf(TerminalUnitSnapshot),
+        row_space_revision: u64 = 0,
+        units: ?[*]const TerminalUnit = null,
+        unit_count: usize = 0,
+        truncated: bool = false,
+        reserved0: [7]u8 = @splat(0),
+        allocation: ?*anyopaque = null,
+        allocation_len: usize = 0,
+        reserved: [4]u64 = @splat(0),
+    };
+
+    const TerminalUnitText = extern struct {
+        struct_size: usize = @sizeOf(TerminalUnitText),
+        command: ?[*]const u8 = null,
+        command_len: usize = 0,
+        output: ?[*]const u8 = null,
+        output_len: usize = 0,
+        allocation: ?*anyopaque = null,
+        allocation_len: usize = 0,
+        reserved: [4]u64 = @splat(0),
+    };
+
+    fn versionedFieldFits(
+        comptime T: type,
+        comptime field_name: []const u8,
+        supplied_size: usize,
+    ) bool {
+        const Field = @TypeOf(@field(@as(T, undefined), field_name));
+        return supplied_size >=
+            @offsetOf(T, field_name) + @sizeOf(Field);
+    }
+
+    fn resetTerminalUnitSnapshot(
+        out: *TerminalUnitSnapshot,
+        supplied_size: usize,
+    ) void {
+        if (versionedFieldFits(
+            TerminalUnitSnapshot,
+            "row_space_revision",
+            supplied_size,
+        )) out.row_space_revision = 0;
+        if (versionedFieldFits(
+            TerminalUnitSnapshot,
+            "units",
+            supplied_size,
+        )) out.units = null;
+        if (versionedFieldFits(
+            TerminalUnitSnapshot,
+            "unit_count",
+            supplied_size,
+        )) out.unit_count = 0;
+        if (versionedFieldFits(
+            TerminalUnitSnapshot,
+            "truncated",
+            supplied_size,
+        )) out.truncated = false;
+        if (versionedFieldFits(
+            TerminalUnitSnapshot,
+            "reserved0",
+            supplied_size,
+        )) out.reserved0 = @splat(0);
+        if (versionedFieldFits(
+            TerminalUnitSnapshot,
+            "allocation",
+            supplied_size,
+        )) out.allocation = null;
+        if (versionedFieldFits(
+            TerminalUnitSnapshot,
+            "allocation_len",
+            supplied_size,
+        )) out.allocation_len = 0;
+        if (versionedFieldFits(
+            TerminalUnitSnapshot,
+            "reserved",
+            supplied_size,
+        )) out.reserved = @splat(0);
+    }
+
+    fn resetTerminalUnitText(
+        out: *TerminalUnitText,
+        supplied_size: usize,
+    ) void {
+        if (versionedFieldFits(
+            TerminalUnitText,
+            "command",
+            supplied_size,
+        )) out.command = null;
+        if (versionedFieldFits(
+            TerminalUnitText,
+            "command_len",
+            supplied_size,
+        )) out.command_len = 0;
+        if (versionedFieldFits(
+            TerminalUnitText,
+            "output",
+            supplied_size,
+        )) out.output = null;
+        if (versionedFieldFits(
+            TerminalUnitText,
+            "output_len",
+            supplied_size,
+        )) out.output_len = 0;
+        if (versionedFieldFits(
+            TerminalUnitText,
+            "allocation",
+            supplied_size,
+        )) out.allocation = null;
+        if (versionedFieldFits(
+            TerminalUnitText,
+            "allocation_len",
+            supplied_size,
+        )) out.allocation_len = 0;
+        if (versionedFieldFits(
+            TerminalUnitText,
+            "reserved",
+            supplied_size,
+        )) out.reserved = @splat(0);
+    }
+
     // ghostty_clipboard_content_s
     const ClipboardContent = extern struct {
         mime: [*:0]const u8,
@@ -2648,6 +2810,333 @@ pub const CAPI = struct {
             ),
         };
         return true;
+    }
+
+    /// Return the exact absolute row selected by the latest prompt jump.
+    /// This remains authoritative when the selected prompt is in the active
+    /// area and the viewport intentionally retains its `.active` identity.
+    export fn ghostty_surface_prompt_jump_landing(
+        surface: *Surface,
+        absolute_row: *u64,
+    ) bool {
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.lockDemand();
+        defer core_surface.renderer_state.unlockDemand();
+
+        const row = core_surface.renderer_state.terminal.screens.active.pages
+            .promptJumpLandingRow() orelse return false;
+        absolute_row.* = row;
+        return true;
+    }
+
+    fn terminalUnitRangeC(
+        value: terminal.Terminal.TerminalUnitRange,
+    ) TerminalUnitRange {
+        return .{
+            .start_row = value.start_row,
+            .end_row = value.end_row,
+            .start_column = value.start_column,
+            .end_column = value.end_column,
+            .present = value.present,
+        };
+    }
+
+    export fn ghostty_surface_terminal_units_snapshot(
+        surface: *Surface,
+        first_absolute_row: u64,
+        row_count: u64,
+        maximum_units: usize,
+        out: *TerminalUnitSnapshot,
+    ) TerminalUnitResult {
+        const supplied_size = out.struct_size;
+        resetTerminalUnitSnapshot(out, supplied_size);
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.lockDemand();
+        defer core_surface.renderer_state.unlockDemand();
+
+        const terminal_ = core_surface.renderer_state.terminal;
+        var snapshot = terminal_.terminalUnitSnapshot(
+            global.alloc,
+            first_absolute_row,
+            row_count,
+            maximum_units,
+        ) catch |err| return switch (err) {
+            error.OutOfMemory => .out_of_memory,
+            error.InvalidWindow => .invalid_window,
+        };
+        defer snapshot.deinit(global.alloc);
+
+        const can_return_units =
+            versionedFieldFits(
+                TerminalUnitSnapshot,
+                "units",
+                supplied_size,
+            ) and
+            versionedFieldFits(
+                TerminalUnitSnapshot,
+                "unit_count",
+                supplied_size,
+            ) and
+            versionedFieldFits(
+                TerminalUnitSnapshot,
+                "allocation",
+                supplied_size,
+            ) and
+            versionedFieldFits(
+                TerminalUnitSnapshot,
+                "allocation_len",
+                supplied_size,
+            );
+        const unit_bytes = std.math.mul(
+            usize,
+            if (can_return_units) snapshot.units.len else 0,
+            @sizeOf(TerminalUnit),
+        ) catch return .out_of_memory;
+        var allocation_len = unit_bytes;
+        if (can_return_units) {
+            for (snapshot.units) |unit| {
+                if (unit.command_start_pwd) |pwd_| {
+                    allocation_len = std.math.add(
+                        usize,
+                        allocation_len,
+                        pwd_.len,
+                    ) catch return .out_of_memory;
+                }
+            }
+        }
+
+        const allocation = if (allocation_len > 0)
+            global.alloc.alignedAlloc(
+                u8,
+                .of(TerminalUnit),
+                allocation_len,
+            ) catch return .out_of_memory
+        else
+            null;
+        errdefer if (allocation) |memory| global.alloc.free(memory);
+
+        var pwd_offset = unit_bytes;
+        if (allocation) |memory| {
+            const units: [*]TerminalUnit = @ptrCast(@alignCast(memory.ptr));
+            for (snapshot.units, 0..) |unit, index| {
+                const completion = switch (unit.lifecycle) {
+                    .closed => |closed| closed,
+                    else => null,
+                };
+                const pwd_ptr: ?[*]const u8 = if (unit.command_start_pwd) |pwd_| pwd: {
+                    @memcpy(memory[pwd_offset..][0..pwd_.len], pwd_);
+                    const ptr = memory.ptr + pwd_offset;
+                    pwd_offset += pwd_.len;
+                    break :pwd ptr;
+                } else null;
+                units[index] = .{
+                    .unit_id = unit.unit_id,
+                    .prompt = terminalUnitRangeC(unit.prompt),
+                    .command = terminalUnitRangeC(unit.command),
+                    .output = terminalUnitRangeC(unit.output),
+                    .lifecycle = switch (unit.lifecycle) {
+                        .open => .open,
+                        .closed => .closed,
+                        .closed_unknown => .closed_unknown,
+                    },
+                    .exit_status = if (completion) |value|
+                        value.exit_status
+                    else
+                        0,
+                    .has_duration = if (completion) |value|
+                        value.duration_ns != null
+                    else
+                        false,
+                    .duration_ns = if (completion) |value|
+                        value.duration_ns orelse 0
+                    else
+                        0,
+                    .command_start_pwd = pwd_ptr,
+                    .command_start_pwd_len = if (unit.command_start_pwd) |pwd_|
+                        pwd_.len
+                    else
+                        0,
+                };
+            }
+            out.units = units;
+            out.allocation = memory.ptr;
+            out.allocation_len = memory.len;
+        }
+
+        const screens = &terminal_.screens;
+        if (versionedFieldFits(
+            TerminalUnitSnapshot,
+            "row_space_revision",
+            supplied_size,
+        )) {
+            out.row_space_revision = core_surface.rowSpaceIdentity(
+                screens.active_key,
+                screens.generation(screens.active_key),
+                snapshot.row_space_revision,
+            );
+        }
+        if (versionedFieldFits(
+            TerminalUnitSnapshot,
+            "unit_count",
+            supplied_size,
+        )) out.unit_count = if (can_return_units) snapshot.units.len else 0;
+        if (versionedFieldFits(
+            TerminalUnitSnapshot,
+            "truncated",
+            supplied_size,
+        )) {
+            out.truncated = snapshot.truncated or
+                (!can_return_units and snapshot.units.len > 0);
+        }
+        return .ok;
+    }
+
+    export fn ghostty_surface_free_terminal_units_snapshot(
+        _: *Surface,
+        snapshot: *TerminalUnitSnapshot,
+    ) void {
+        const supplied_size = snapshot.struct_size;
+        if (versionedFieldFits(
+            TerminalUnitSnapshot,
+            "allocation",
+            supplied_size,
+        ) and versionedFieldFits(
+            TerminalUnitSnapshot,
+            "allocation_len",
+            supplied_size,
+        )) {
+            if (snapshot.allocation) |allocation| {
+                const memory: [*]align(@alignOf(TerminalUnit)) u8 =
+                    @ptrCast(@alignCast(allocation));
+                global.alloc.free(memory[0..snapshot.allocation_len]);
+            }
+        }
+        resetTerminalUnitSnapshot(snapshot, supplied_size);
+    }
+
+    export fn ghostty_surface_read_terminal_unit_text(
+        surface: *Surface,
+        expected_row_space_revision: u64,
+        unit_id: u64,
+        out: *TerminalUnitText,
+    ) TerminalUnitResult {
+        const supplied_size = out.struct_size;
+        resetTerminalUnitText(out, supplied_size);
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.lockDemand();
+        defer core_surface.renderer_state.unlockDemand();
+
+        const terminal_ = core_surface.renderer_state.terminal;
+        const screens = &terminal_.screens;
+        const local_revision =
+            screens.active.pages.scrollbar().row_space_revision;
+        const row_space_revision = core_surface.rowSpaceIdentity(
+            screens.active_key,
+            screens.generation(screens.active_key),
+            local_revision,
+        );
+        if (row_space_revision != expected_row_space_revision)
+            return .stale_revision;
+
+        const text_ = terminal_.terminalUnitText(
+            global.alloc,
+            local_revision,
+            unit_id,
+        ) catch |err| return switch (err) {
+            error.OutOfMemory => .out_of_memory,
+            error.StaleRevision => .stale_revision,
+            error.InvalidUnit => .invalid_unit,
+            error.NotClosed => .not_closed,
+            error.NotRetained => .not_retained,
+        };
+        defer text_.deinit(global.alloc);
+
+        const command = text_.command orelse "";
+        const output = text_.output orelse "";
+        const can_return_text =
+            versionedFieldFits(
+                TerminalUnitText,
+                "command",
+                supplied_size,
+            ) and
+            versionedFieldFits(
+                TerminalUnitText,
+                "command_len",
+                supplied_size,
+            ) and
+            versionedFieldFits(
+                TerminalUnitText,
+                "output",
+                supplied_size,
+            ) and
+            versionedFieldFits(
+                TerminalUnitText,
+                "output_len",
+                supplied_size,
+            ) and
+            versionedFieldFits(
+                TerminalUnitText,
+                "allocation",
+                supplied_size,
+            ) and
+            versionedFieldFits(
+                TerminalUnitText,
+                "allocation_len",
+                supplied_size,
+            );
+        const allocation_len = std.math.add(
+            usize,
+            if (can_return_text) command.len else 0,
+            if (can_return_text) output.len else 0,
+        ) catch return .out_of_memory;
+        const allocation = if (allocation_len > 0)
+            global.alloc.alloc(u8, allocation_len) catch
+                return .out_of_memory
+        else
+            null;
+        errdefer if (allocation) |memory| global.alloc.free(memory);
+
+        if (allocation) |memory| {
+            @memcpy(memory[0..command.len], command);
+            @memcpy(memory[command.len..], output);
+            out.command = memory.ptr;
+            out.output = memory.ptr + command.len;
+            out.allocation = memory.ptr;
+            out.allocation_len = memory.len;
+        }
+        if (versionedFieldFits(
+            TerminalUnitText,
+            "command_len",
+            supplied_size,
+        )) out.command_len = if (can_return_text) command.len else 0;
+        if (versionedFieldFits(
+            TerminalUnitText,
+            "output_len",
+            supplied_size,
+        )) out.output_len = if (can_return_text) output.len else 0;
+        return .ok;
+    }
+
+    export fn ghostty_surface_free_terminal_unit_text(
+        _: *Surface,
+        text_: *TerminalUnitText,
+    ) void {
+        const supplied_size = text_.struct_size;
+        if (versionedFieldFits(
+            TerminalUnitText,
+            "allocation",
+            supplied_size,
+        ) and versionedFieldFits(
+            TerminalUnitText,
+            "allocation_len",
+            supplied_size,
+        )) {
+            if (text_.allocation) |allocation| {
+                const memory: [*]u8 = @ptrCast(allocation);
+                global.alloc.free(memory[0..text_.allocation_len]);
+            }
+        }
+        resetTerminalUnitText(text_, supplied_size);
     }
 
     /// Atomically validate an absolute row-space identity and scroll within it.
@@ -4126,6 +4615,77 @@ test "render grid preserves terminal color semantics" {
     const rgb = CAPI.renderGridColorSemantics(.{ .rgb = .{ .r = 1, .g = 2, .b = 3 } });
     try std.testing.expectEqual(CAPI.RenderGridColorSource.rgb, rgb.source);
     try std.testing.expectEqual(@as(?u8, null), rgb.palette_index);
+}
+
+test "terminal-unit ABI frees are idempotent and zero outputs" {
+    var surface: Surface = undefined;
+
+    var snapshot: CAPI.TerminalUnitSnapshot = .{};
+    snapshot.unit_count = 1;
+    snapshot.truncated = true;
+    CAPI.ghostty_surface_free_terminal_units_snapshot(&surface, &snapshot);
+    CAPI.ghostty_surface_free_terminal_units_snapshot(&surface, &snapshot);
+    try std.testing.expectEqual(@as(?*anyopaque, null), snapshot.allocation);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.unit_count);
+    try std.testing.expectEqual(
+        @sizeOf(CAPI.TerminalUnitSnapshot),
+        snapshot.struct_size,
+    );
+
+    var text_: CAPI.TerminalUnitText = .{};
+    text_.command_len = 16;
+    CAPI.ghostty_surface_free_terminal_unit_text(&surface, &text_);
+    CAPI.ghostty_surface_free_terminal_unit_text(&surface, &text_);
+    try std.testing.expectEqual(@as(?*anyopaque, null), text_.allocation);
+    try std.testing.expectEqual(@as(?[*]const u8, null), text_.command);
+    try std.testing.expectEqual(@as(usize, 0), text_.command_len);
+    try std.testing.expectEqual(@sizeOf(CAPI.TerminalUnitText), text_.struct_size);
+}
+
+test "terminal-unit ABI frees honor caller struct size" {
+    var surface: Surface = undefined;
+
+    var snapshot: CAPI.TerminalUnitSnapshot = .{
+        .struct_size = @offsetOf(
+            CAPI.TerminalUnitSnapshot,
+            "allocation",
+        ),
+        .row_space_revision = 42,
+        .unit_count = 7,
+        .truncated = true,
+        .allocation = @ptrFromInt(1),
+        .allocation_len = 99,
+        .reserved = @splat(0xA5),
+    };
+    CAPI.ghostty_surface_free_terminal_units_snapshot(&surface, &snapshot);
+    try std.testing.expectEqual(@as(u64, 0), snapshot.row_space_revision);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.unit_count);
+    try std.testing.expect(!snapshot.truncated);
+    try std.testing.expectEqual(@as(?*anyopaque, @ptrFromInt(1)), snapshot.allocation);
+    try std.testing.expectEqual(@as(usize, 99), snapshot.allocation_len);
+    try std.testing.expectEqual([4]u64{ 0xA5, 0xA5, 0xA5, 0xA5 }, snapshot.reserved);
+
+    var text_: CAPI.TerminalUnitText = .{
+        .struct_size = @offsetOf(
+            CAPI.TerminalUnitText,
+            "allocation",
+        ),
+        .command = @ptrFromInt(1),
+        .command_len = 13,
+        .output = @ptrFromInt(2),
+        .output_len = 17,
+        .allocation = @ptrFromInt(3),
+        .allocation_len = 101,
+        .reserved = @splat(0x5A),
+    };
+    CAPI.ghostty_surface_free_terminal_unit_text(&surface, &text_);
+    try std.testing.expectEqual(@as(?[*]const u8, null), text_.command);
+    try std.testing.expectEqual(@as(usize, 0), text_.command_len);
+    try std.testing.expectEqual(@as(?[*]const u8, null), text_.output);
+    try std.testing.expectEqual(@as(usize, 0), text_.output_len);
+    try std.testing.expectEqual(@as(?*anyopaque, @ptrFromInt(3)), text_.allocation);
+    try std.testing.expectEqual(@as(usize, 101), text_.allocation_len);
+    try std.testing.expectEqual([4]u64{ 0x5A, 0x5A, 0x5A, 0x5A }, text_.reserved);
 }
 
 test "render presentation callback setter is per surface" {
