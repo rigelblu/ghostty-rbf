@@ -127,7 +127,6 @@ pub const TerminalUnitData = struct {
     duration_ns: ?u64 = null,
     exit_status: i32 = 0,
     pwd: ?Offset(u8).Slice = null,
-    leading_boundary_rows: u8 = 0,
     lifecycle: enum(u8) {
         open = 0,
         closed = 1,
@@ -2227,7 +2226,15 @@ pub const Row = packed struct(u64) {
     /// One-based index into Page.terminal_unit_ids. Zero means no marker.
     terminal_unit_slot: u16 = 0,
 
-    _padding: u7 = 0,
+    /// This blank row is reserved as breathing room between terminal units.
+    ///
+    /// The marker belongs to the row rather than a unit snapshot so row
+    /// movement keeps it attached to the cells it describes. Any visible
+    /// write, erase, or structural replacement clears it before consumers
+    /// can continue treating the row as safe overlay space.
+    terminal_unit_boundary: bool = false,
+
+    _padding: u6 = 0,
 
     /// The semantic prompt state of the row. See `semantic_prompt`.
     pub const SemanticPrompt = enum(u2) {
@@ -2455,6 +2462,30 @@ pub const Cell = packed struct(u64) {
     pub inline fn hasTextAny(cells: []const Cell) bool {
         for (cells) |cell| {
             if (cell.hasText()) return true;
+        }
+
+        return false;
+    }
+
+    /// Returns true if this cell paints a visible glyph.
+    ///
+    /// This is deliberately more permissive than `hasText`: a space is
+    /// text but paints nothing, and shells write spaces into the row
+    /// preceding a prompt (zsh's `prompt_sp`, for example) as part of
+    /// ordinary prompt rendering. Treating those rows as occupied would
+    /// make every command whose output lacks a trailing newline look
+    /// like it has content where it visually does not.
+    ///
+    /// Background-only cells return false for the same reason `hasText`
+    /// does: they paint a color band, not a glyph.
+    pub inline fn rendersGlyph(self: Cell) bool {
+        return self.hasText() and self.codepoint() != ' ';
+    }
+
+    /// Returns true if any cell in the set paints a visible glyph.
+    pub inline fn rendersGlyphAny(cells: []const Cell) bool {
+        for (cells) |cell| {
+            if (cell.rendersGlyph()) return true;
         }
 
         return false;
