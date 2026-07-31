@@ -676,6 +676,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             blending: configpkg.Config.AlphaBlending,
             background_blur: configpkg.Config.BackgroundBlur,
             macos_background_from_layer: bool,
+            macos_background_image_from_layer: bool,
             scroll_to_bottom_on_output: bool,
 
             pub fn init(
@@ -751,6 +752,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .blending = config.@"alpha-blending",
                     .background_blur = config.@"background-blur",
                     .macos_background_from_layer = config.@"macos-background-from-layer",
+                    .macos_background_image_from_layer = config.@"macos-background-image-from-layer",
                     .scroll_to_bottom_on_output = config.@"scroll-to-bottom".output,
                     .arena = arena,
                 };
@@ -760,6 +762,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const alloc = self.arena.allocator();
                 self.links.deinit(alloc);
                 self.arena.deinit();
+            }
+
+            /// Whether the host app, rather than this renderer, draws the
+            /// backdrop -- the plain background color and, when the host
+            /// asks for it, the background image too.
+            ///
+            /// Both the bg_color alpha decision and the draw pass read this
+            /// so they cannot disagree: zeroing the alpha while still
+            /// drawing the image (or the reverse) leaves the backdrop
+            /// either doubled or missing.
+            pub fn hostOwnsBackdrop(self: DerivedConfig) bool {
+                if (comptime builtin.os.tag != .macos) return false;
+                if (!self.macos_background_from_layer) return false;
+                // Without the image opt-in the host owns the color only,
+                // so a configured image pulls the backdrop back here.
+                return self.bg_image == null or self.macos_background_image_from_layer;
             }
         };
 
@@ -1575,15 +1593,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     @intFromFloat(@round(self.config.background_opacity * 255.0)),
                 };
 
-                // On macOS, glass styles and plain layer-background mode
-                // zero bg_color alpha so that per-cell backgrounds in the
+                // On macOS, glass styles and layer-background mode zero
+                // bg_color alpha so that per-cell backgrounds in the
                 // shaders composite to transparent instead of the terminal
                 // background (the host layer provides the background).
-                // When a background image is active, keep bg_color alpha so
-                // the bg_image shader can composite and opacity-scale it.
-                // The fullscreen background color draw call is still skipped
-                // for layer-background mode when no image is present (see
-                // the draw pass below).
+                //
+                // A background image normally reclaims the backdrop, since
+                // the bg_image shader needs bg_color's alpha to composite
+                // and opacity-scale against. macos-background-image-from-layer
+                // hands the image to the host as well, in which case the
+                // alpha stays zeroed and the draw pass below skips the
+                // image entirely.
                 if (comptime builtin.os.tag == .macos) {
                     switch (self.config.background_blur) {
                         .@"macos-glass-regular",
@@ -1592,8 +1612,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                         else => {},
                     }
-                    if (self.config.macos_background_from_layer and self.config.bg_image == null)
-                        self.uniforms.bg_color[3] = 0;
+                    if (self.config.hostOwnsBackdrop()) self.uniforms.bg_color[3] = 0;
                 }
 
                 // Prepare our overlay image for upload (or unload). This
@@ -1827,30 +1846,27 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Otherwise, if we don't have a background image, we
                 // draw the background color by itself in its own step.
                 //
-                // When the host app provides the plain background via a
-                // CALayer (macos_background_from_layer), skip only the
-                // fullscreen color fill — background images still need to
-                // be rendered by Ghostty.
+                // When the host app owns the backdrop (see hostOwnsBackdrop),
+                // skip both passes: the host's CALayer already provides the
+                // color, and under macos-background-image-from-layer it
+                // provides the image too. Drawing either here would paint
+                // over the host's composition.
                 //
                 // NOTE: We don't use the clear_color for this because that
                 //       would require us to do color space conversion on the
                 //       CPU-side. In the future when we have utilities for
                 //       that we should remove this step and use clear_color.
-                const skip_bg_fill = if (comptime builtin.os.tag == .macos)
-                    self.config.macos_background_from_layer
-                else
-                    false;
-                if (self.bg_image) |img| switch (img) {
-                    .ready => |texture| pass.step(.{
-                        .pipeline = self.shaders.pipelines.bg_image,
-                        .uniforms = frame.uniforms.buffer,
-                        .buffers = &.{frame.bg_image_buffer.buffer},
-                        .textures = &.{texture},
-                        .draw = .{ .type = .triangle, .vertex_count = 3 },
-                    }),
-                    else => {},
-                } else {
-                    if (!skip_bg_fill) {
+                if (!self.config.hostOwnsBackdrop()) {
+                    if (self.bg_image) |img| switch (img) {
+                        .ready => |texture| pass.step(.{
+                            .pipeline = self.shaders.pipelines.bg_image,
+                            .uniforms = frame.uniforms.buffer,
+                            .buffers = &.{frame.bg_image_buffer.buffer},
+                            .textures = &.{texture},
+                            .draw = .{ .type = .triangle, .vertex_count = 3 },
+                        }),
+                        else => {},
+                    } else {
                         pass.step(.{
                             .pipeline = self.shaders.pipelines.bg_color,
                             .uniforms = frame.uniforms.buffer,

@@ -664,8 +664,16 @@ typedef struct {
   uint64_t duration_ns;
   const char* command_start_pwd;
   size_t command_start_pwd_len;
+  // Blank grid rows available immediately before this unit's prompt and
+  // immediately after its last output row. These are derived from the live
+  // grid for every snapshot rather than stored, so they always describe the
+  // rows as they exist now: a row that has since been overwritten, reflowed,
+  // erased, or evicted reports zero rather than promising empty space that a
+  // caller would then paint chrome into. `trailing_boundary_rows` is always
+  // zero for an open unit.
   uint8_t leading_boundary_rows;
-  uint8_t reserved1[7];
+  uint8_t trailing_boundary_rows;
+  uint8_t reserved1[6];
   uint64_t reserved[3];
 } ghostty_terminal_unit_s;
 

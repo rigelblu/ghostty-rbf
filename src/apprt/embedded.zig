@@ -1888,7 +1888,8 @@ pub const CAPI = struct {
         command_start_pwd: ?[*]const u8 = null,
         command_start_pwd_len: usize = 0,
         leading_boundary_rows: u8 = 0,
-        reserved1: [7]u8 = @splat(0),
+        trailing_boundary_rows: u8 = 0,
+        reserved1: [6]u8 = @splat(0),
         reserved: [3]u64 = @splat(0),
     };
 
@@ -2959,6 +2960,7 @@ pub const CAPI = struct {
                     else
                         0,
                     .leading_boundary_rows = unit.leading_boundary_rows,
+                    .trailing_boundary_rows = unit.trailing_boundary_rows,
                 };
             }
             out.units = units;
