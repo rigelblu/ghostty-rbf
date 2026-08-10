@@ -7271,8 +7271,8 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             // embedded callers can immediately read the authoritative landing
             // row after a successful binding action.
             {
-                self.renderer_state.mutex.lock();
-                defer self.renderer_state.mutex.unlock();
+                self.renderer_state.mutex.lockUncancelable(global.io());
+                defer self.renderer_state.mutex.unlock(global.io());
                 self.renderer_state.terminal.screens.active.scroll(.{
                     .delta_prompt = @intCast(delta),
                 });

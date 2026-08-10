@@ -127,7 +127,7 @@ const hyperlink_cell_multiplier = 16;
 
 pub const TerminalUnitData = struct {
     unit_id: u64 = 0,
-    started_at: ?std.time.Instant = null,
+    started_at: ?std.Io.Timestamp = null,
     duration_ns: ?u64 = null,
     exit_status: i32 = 0,
     pwd: ?Offset(u8).Slice = null,
@@ -1840,6 +1840,10 @@ pub const Page = struct {
         row: *Row,
         unit_id: u64,
         pwd: ?[]const u8,
+        // Read by the caller, which owns an `io`. Zig 0.16 removed
+        // `std.time.Instant`, and its replacement needs one — which this file
+        // must not have: page.zig is part of the standalone ghostty-vt lib.
+        started_at: ?std.Io.Timestamp,
     ) error{OutOfSpace}!void {
         assert(unit_id != 0);
         self.clearTerminalUnitId(row);
@@ -1863,7 +1867,7 @@ pub const Page = struct {
         self.setTerminalUnitData(row, .{
             .unit_id = unit_id,
             .pwd = pwd_page,
-            .started_at = std.time.Instant.now() catch null,
+            .started_at = started_at,
         }) catch return error.OutOfSpace;
     }
 

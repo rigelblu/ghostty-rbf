@@ -4775,6 +4775,7 @@ fn startTerminalUnit(self: *Terminal) void {
         self.terminal_unit_next_id +%= 1;
     }
 
+    const started_at: std.Io.Timestamp = .now(self.io(), .awake);
     prompt_page.setTerminalUnit(
         prompt_row,
         unit_id,
@@ -4782,6 +4783,7 @@ fn startTerminalUnit(self: *Terminal) void {
         // holding a stale *local* path. Stamping that would label remote work
         // with a directory the command never ran in, so report none instead.
         if (self.flags.pwd_remote) null else self.getPwd(),
+        started_at,
     ) catch return;
     self.terminal_unit_open_id = unit_id;
     self.advanceTerminalUnitActivity();
@@ -4800,10 +4802,14 @@ fn finishTerminalUnit(self: *Terminal, exit_status: ?i32) void {
         self.advanceTerminalUnitActivity();
         return;
     }
-    data.duration_ns = if (data.started_at) |started|
-        if (std.time.Instant.now()) |now| now.since(started) else |_| null
-    else
-        null;
+    data.duration_ns = if (data.started_at) |started| duration: {
+        const end: std.Io.Timestamp = .now(self.io(), .awake);
+        break :duration @intCast(std.math.clamp(
+            started.durationTo(end).nanoseconds,
+            0,
+            std.math.maxInt(u64),
+        ));
+    } else null;
     data.exit_status = exit_status.?;
     data.lifecycle = .closed;
     self.terminal_unit_boundary_pending = true;

@@ -3496,8 +3496,8 @@ pub const CAPI = struct {
         absolute_row: *u64,
     ) bool {
         const core_surface = &surface.core_surface;
-        core_surface.renderer_state.lockDemand();
-        defer core_surface.renderer_state.unlockDemand();
+        core_surface.renderer_state.lockDemand(global.io());
+        defer core_surface.renderer_state.unlockDemand(global.io());
 
         const row = core_surface.renderer_state.terminal.screens.active.pages
             .promptJumpLandingRow() orelse return false;
@@ -3527,12 +3527,12 @@ pub const CAPI = struct {
         const supplied_size = out.struct_size;
         resetTerminalUnitSnapshot(out, supplied_size);
         const core_surface = &surface.core_surface;
-        core_surface.renderer_state.lockDemand();
-        defer core_surface.renderer_state.unlockDemand();
+        core_surface.renderer_state.lockDemand(global.io());
+        defer core_surface.renderer_state.unlockDemand(global.io());
 
         const terminal_ = core_surface.renderer_state.terminal;
         var snapshot = terminal_.terminalUnitSnapshot(
-            global.alloc,
+            global.alloc(),
             first_absolute_row,
             row_count,
             maximum_units,
@@ -3540,7 +3540,7 @@ pub const CAPI = struct {
             error.OutOfMemory => .out_of_memory,
             error.InvalidWindow => .invalid_window,
         };
-        defer snapshot.deinit(global.alloc);
+        defer snapshot.deinit(global.alloc());
 
         const can_return_units =
             versionedFieldFits(
@@ -3582,14 +3582,14 @@ pub const CAPI = struct {
         }
 
         const allocation = if (allocation_len > 0)
-            global.alloc.alignedAlloc(
+            global.alloc().alignedAlloc(
                 u8,
                 .of(TerminalUnit),
                 allocation_len,
             ) catch return .out_of_memory
         else
             null;
-        errdefer if (allocation) |memory| global.alloc.free(memory);
+        errdefer if (allocation) |memory| global.alloc().free(memory);
 
         var pwd_offset = unit_bytes;
         if (allocation) |memory| {
@@ -3686,7 +3686,7 @@ pub const CAPI = struct {
             if (snapshot.allocation) |allocation| {
                 const memory: [*]align(@alignOf(TerminalUnit)) u8 =
                     @ptrCast(@alignCast(allocation));
-                global.alloc.free(memory[0..snapshot.allocation_len]);
+                global.alloc().free(memory[0..snapshot.allocation_len]);
             }
         }
         resetTerminalUnitSnapshot(snapshot, supplied_size);
@@ -3701,8 +3701,8 @@ pub const CAPI = struct {
         const supplied_size = out.struct_size;
         resetTerminalUnitText(out, supplied_size);
         const core_surface = &surface.core_surface;
-        core_surface.renderer_state.lockDemand();
-        defer core_surface.renderer_state.unlockDemand();
+        core_surface.renderer_state.lockDemand(global.io());
+        defer core_surface.renderer_state.unlockDemand(global.io());
 
         const terminal_ = core_surface.renderer_state.terminal;
         const screens = &terminal_.screens;
@@ -3717,7 +3717,7 @@ pub const CAPI = struct {
             return .stale_revision;
 
         const text_ = terminal_.terminalUnitText(
-            global.alloc,
+            global.alloc(),
             local_revision,
             unit_id,
         ) catch |err| return switch (err) {
@@ -3727,7 +3727,7 @@ pub const CAPI = struct {
             error.NotClosed => .not_closed,
             error.NotRetained => .not_retained,
         };
-        defer text_.deinit(global.alloc);
+        defer text_.deinit(global.alloc());
 
         const command = text_.command orelse "";
         const output = text_.output orelse "";
@@ -3768,11 +3768,11 @@ pub const CAPI = struct {
             if (can_return_text) output.len else 0,
         ) catch return .out_of_memory;
         const allocation = if (allocation_len > 0)
-            global.alloc.alloc(u8, allocation_len) catch
+            global.alloc().alloc(u8, allocation_len) catch
                 return .out_of_memory
         else
             null;
-        errdefer if (allocation) |memory| global.alloc.free(memory);
+        errdefer if (allocation) |memory| global.alloc().free(memory);
 
         if (allocation) |memory| {
             @memcpy(memory[0..command.len], command);
@@ -3811,7 +3811,7 @@ pub const CAPI = struct {
         )) {
             if (text_.allocation) |allocation| {
                 const memory: [*]u8 = @ptrCast(allocation);
-                global.alloc.free(memory[0..text_.allocation_len]);
+                global.alloc().free(memory[0..text_.allocation_len]);
             }
         }
         resetTerminalUnitText(text_, supplied_size);
