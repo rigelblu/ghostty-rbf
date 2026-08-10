@@ -1055,6 +1055,28 @@ palette: Palette = .{},
 /// during view resizes.
 @"macos-background-from-layer": bool = false,
 
+/// When true on macOS, extend `macos-background-from-layer` to cover
+/// `background-image` as well as the plain background color.
+///
+/// `macos-background-from-layer` alone delegates only the color: the
+/// moment a `background-image` is configured, the renderer takes the
+/// whole backdrop back and paints the image inside each surface. For an
+/// embedding app that composites one backdrop beneath several surfaces,
+/// that reclaim is visible as a seam — each surface fits the image to
+/// its own viewport, so a split renders two independently-cropped
+/// copies, and any host chrome drawn between surfaces has no image
+/// under it at all.
+///
+/// With this set, the renderer keeps the backdrop delegated: bg_color
+/// alpha stays zeroed and the background image pass is skipped even
+/// when `background-image` is set. The host is then responsible for
+/// drawing the image itself, including honoring `background-image-fit`,
+/// `-position`, `-opacity`, and `-repeat`; Ghostty draws only glyphs
+/// and per-cell backgrounds over it.
+///
+/// Has no effect unless `macos-background-from-layer` is also true.
+@"macos-background-image-from-layer": bool = false,
+
 /// The opacity level (opposite of transparency) of an unfocused split.
 /// Unfocused splits by default are slightly faded out to make it easier to see
 /// which split is focused. To disable this feature, set this value to 1.

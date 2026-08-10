@@ -39,6 +39,9 @@ generations: std.EnumMap(Key, usize),
 /// renderer observe selection changes without acquiring the terminal mutex.
 selection_activity: *std.atomic.Value(u64),
 
+/// Lock-free epoch for semantic terminal-unit and row-space changes.
+terminal_unit_activity: *std.atomic.Value(u64),
+
 pub fn init(
     io: std.Io,
     alloc: Allocator,
@@ -47,12 +50,16 @@ pub fn init(
     const selection_activity = try alloc.create(std.atomic.Value(u64));
     errdefer alloc.destroy(selection_activity);
     selection_activity.* = .init(0);
+    const terminal_unit_activity = try alloc.create(std.atomic.Value(u64));
+    errdefer alloc.destroy(terminal_unit_activity);
+    terminal_unit_activity.* = .init(0);
 
     // We need to initialize our initial primary screen
     const screen = try alloc.create(Screen);
     errdefer alloc.destroy(screen);
     var screen_opts = opts;
     screen_opts.selection_activity_shared = selection_activity;
+    screen_opts.terminal_unit_activity_shared = terminal_unit_activity;
     screen.* = try .init(io, alloc, screen_opts);
     return .{
         .active_key = .primary,
@@ -60,6 +67,7 @@ pub fn init(
         .all = .init(.{ .primary = screen }),
         .generations = .initFull(0),
         .selection_activity = selection_activity,
+        .terminal_unit_activity = terminal_unit_activity,
     };
 }
 
@@ -71,6 +79,7 @@ pub fn deinit(self: *ScreenSet, alloc: Allocator) void {
         alloc.destroy(entry.value.*);
     }
     alloc.destroy(self.selection_activity);
+    alloc.destroy(self.terminal_unit_activity);
 }
 
 /// Get the screen for the given key, if it is initialized.
@@ -96,6 +105,7 @@ pub fn getInit(
     errdefer alloc.destroy(screen);
     var screen_opts = opts;
     screen_opts.selection_activity_shared = self.selection_activity;
+    screen_opts.terminal_unit_activity_shared = self.terminal_unit_activity;
     screen.* = try .init(io, alloc, screen_opts);
     self.all.put(key, screen);
     return screen;
@@ -111,6 +121,7 @@ pub fn remove(
     if (self.all.fetchRemove(key)) |screen| {
         self.generations.put(key, self.generation(key) +% 1);
         _ = self.selection_activity.fetchAdd(1, .release);
+        _ = self.terminal_unit_activity.fetchAdd(1, .release);
         screen.deinit();
         alloc.destroy(screen);
     }
@@ -122,7 +133,10 @@ pub fn switchTo(self: *ScreenSet, key: Key) void {
     const changed = self.active_key != key;
     self.active_key = key;
     self.active = self.all.get(key).?;
-    if (changed) _ = self.selection_activity.fetchAdd(1, .release);
+    if (changed) {
+        _ = self.selection_activity.fetchAdd(1, .release);
+        _ = self.terminal_unit_activity.fetchAdd(1, .release);
+    }
 }
 
 test ScreenSet {

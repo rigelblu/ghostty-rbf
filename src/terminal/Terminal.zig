@@ -35,6 +35,7 @@ const style = @import("style.zig");
 const PageList = @import("PageList.zig");
 const Screen = @import("Screen.zig");
 const ScreenSet = @import("ScreenSet.zig");
+const Selection = @import("Selection.zig");
 const Page = pagepkg.Page;
 const Cell = pagepkg.Cell;
 const Row = pagepkg.Row;
@@ -68,6 +69,15 @@ scrolling_region: ScrollingRegion,
 
 /// The last reported pwd, if any.
 pwd: std.ArrayList(u8),
+
+terminal_unit_next_id: u64 = 1,
+terminal_unit_open_id: ?u64 = null,
+
+/// Set when a terminal unit completes, consumed by the next primary-screen
+/// prompt. Boundary row *counts* are never stored: snapshots require both a
+/// live row reservation and a blank row so invalidation cannot leave a stale
+/// count claiming space that now belongs to terminal content.
+terminal_unit_boundary_pending: bool = false,
 
 /// The title of the terminal as set by escape sequences (e.g. OSC 0/2).
 title: std.ArrayList(u8),
@@ -121,6 +131,12 @@ flags: packed struct {
     /// to true based on termios state. This is set
     /// to true based on termios state.
     password_input: bool = false,
+
+    /// True when the last OSC 7 we saw reported a non-local host and was
+    /// therefore rejected. The stored `pwd` is then stale relative to the
+    /// shell actually driving the terminal (an SSH session, typically), so
+    /// consumers that attribute a directory to work must not trust it.
+    pwd_remote: bool = false,
 
     /// True if the terminal should perform selection scrolling.
     selection_scroll: bool = false,
@@ -1073,6 +1089,14 @@ fn printSliceFill(
 
         if (k > 0) {
             assert(k % cells_per_cp == 0);
+            if (cursor.page_row.terminal_unit_boundary) {
+                for (cps[printed .. printed + k / cells_per_cp]) |cp| {
+                    if (cp != 0 and cp != ' ') {
+                        self.invalidateTerminalUnitBoundaryRow(cursor.page_row);
+                        break;
+                    }
+                }
+            }
             cursor.page_row.dirty = true;
             if (style_id != style.default_id) cursor.page_row.styled = true;
             self.clearSemanticPromptRowForOutput();
@@ -1506,6 +1530,11 @@ fn printCell(
 
     const cell = self.screens.active.cursor.page_cell;
     self.clearSemanticPromptRowForOutput();
+    if (c != 0 and c != ' ') {
+        self.invalidateTerminalUnitBoundaryRow(
+            self.screens.active.cursor.page_row,
+        );
+    }
 
     // If the wide property of this cell is the same, then we don't
     // need to do the special handling here because the structure will
@@ -1972,10 +2001,31 @@ pub fn semanticPrompt(
         .fresh_line => try self.semanticPromptFreshLine(),
 
         .fresh_line_new_prompt => {
+            self.closeOpenTerminalUnitUnknown();
+
             // "First do a fresh-line."
             try self.semanticPromptFreshLine();
 
             const screen: *Screen = self.screens.active;
+            if (self.screens.active_key == .primary and
+                self.terminal_unit_boundary_pending)
+            {
+                self.terminal_unit_boundary_pending = false;
+
+                // Mark the actual blank row that the embedder may use for
+                // chrome. A row marker survives row movement but is cleared
+                // as soon as that row is visibly written or structurally
+                // replaced, allowing a single targeted activity notification
+                // instead of refreshing snapshots for every ordinary byte.
+                if (self.terminalUnitBoundaryReservation()) |reservation| {
+                    const row = reservation.pin.rowAndCell().row;
+                    if (!row.terminal_unit_boundary) {
+                        row.terminal_unit_boundary = true;
+                        self.advanceTerminalUnitActivity();
+                    }
+                    if (reservation.advance_cursor) try self.index();
+                }
+            }
 
             // "Subsequent text (until a OSC "133;B" or OSC "133;I" command)
             // is a prompt string (as if followed by OSC 133;P;k=i\007)."
@@ -2055,6 +2105,8 @@ pub fn semanticPrompt(
         },
 
         .end_input_start_output => {
+            self.startTerminalUnit();
+
             // "End of input, and start of output."
             self.screens.active.cursorSetSemanticContent(.output);
 
@@ -2075,6 +2127,11 @@ pub fn semanticPrompt(
         },
 
         .end_command => {
+            // Capture the raw optional status here. Downstream surface
+            // completion events intentionally coerce malformed/missing
+            // statuses, but terminal-unit lifecycle must preserve absence.
+            self.finishTerminalUnit(cmd.readOption(.exit_code));
+
             // From a terminal state perspective, this doesn't really do
             // anything. Other terminals appear to do nothing here. I think
             // its reasonable at this point to reset our semantic content
@@ -2560,6 +2617,14 @@ pub fn selectionActivity(self: *const Terminal) SelectionActivity {
 
 pub const SelectionActivity = u64;
 
+pub fn terminalUnitActivity(self: *const Terminal) u64 {
+    return self.screens.terminal_unit_activity.load(.acquire);
+}
+
+fn advanceTerminalUnitActivity(self: *Terminal) void {
+    _ = self.screens.terminal_unit_activity.fetchAdd(1, .release);
+}
+
 test "Terminal: selection activity follows screen switches and resets" {
     const alloc = testing.allocator;
     var t = try init(testing.io, alloc, .{ .cols = 10, .rows = 5 });
@@ -2648,6 +2713,7 @@ fn rowWillBeShifted(
     page: *Page,
     row: *Row,
 ) void {
+    self.invalidateTerminalUnitBoundaryRow(row);
     const cells = row.cells.ptr(page.memory.ptr);
 
     // If our scrolling region includes the rightmost column then we
@@ -3069,6 +3135,10 @@ pub fn insertBlanks(self: *Terminal, count: usize) void {
     if (self.screens.active.cursor.x < self.scrolling_region.left or
         self.screens.active.cursor.x > self.scrolling_region.right) return;
 
+    self.invalidateTerminalUnitBoundaryRow(
+        self.screens.active.cursor.page_row,
+    );
+
     // If our count is larger than the remaining amount, we just erase right.
     // We only do this if we can erase the entire line (no right margin).
     // if (right_limit == self.cols and
@@ -3161,6 +3231,10 @@ pub fn deleteChars(self: *Terminal, count_req: usize) void {
     if (self.screens.active.cursor.x < self.scrolling_region.left or
         self.screens.active.cursor.x > self.scrolling_region.right) return;
 
+    self.invalidateTerminalUnitBoundaryRow(
+        self.screens.active.cursor.page_row,
+    );
+
     // left is just the cursor position but as a multi-pointer
     const left: [*]Cell = @ptrCast(self.screens.active.cursor.page_cell);
     var page = self.screens.active.cursor.page_pin.node.page();
@@ -3204,6 +3278,10 @@ pub fn deleteChars(self: *Terminal, count_req: usize) void {
 }
 
 pub fn eraseChars(self: *Terminal, count_req: usize) void {
+    self.invalidateTerminalUnitBoundaryRow(
+        self.screens.active.cursor.page_row,
+    );
+
     const count = end: {
         const remaining = self.cols - self.screens.active.cursor.x;
         var end = @min(remaining, @max(count_req, 1));
@@ -3260,6 +3338,10 @@ pub fn eraseLine(
     mode: csi.EraseLine,
     protected_req: bool,
 ) void {
+    self.invalidateTerminalUnitBoundaryRow(
+        self.screens.active.cursor.page_row,
+    );
+
     // Get our start/end positions depending on mode.
     const start, const end = switch (mode) {
         .right => right: {
@@ -3404,7 +3486,13 @@ pub fn eraseDisplay(
                 };
             }
 
-            // All active area
+            // All active area. Clear terminal-unit reservations before the
+            // rows are replaced so snapshots stop advertising erased space.
+            self.invalidateTerminalUnitBoundaryRows(
+                self.screens.active,
+                .{ .active = .{} },
+                null,
+            );
             self.screens.active.clearRows(
                 .{ .active = .{} },
                 null,
@@ -3434,6 +3522,13 @@ pub fn eraseDisplay(
 
             // All lines below
             if (self.screens.active.cursor.y + 1 < self.rows) {
+                self.invalidateTerminalUnitBoundaryRows(
+                    self.screens.active,
+                    .{ .active = .{
+                        .y = self.screens.active.cursor.y + 1,
+                    } },
+                    null,
+                );
                 self.screens.active.clearRows(
                     .{ .active = .{ .y = self.screens.active.cursor.y + 1 } },
                     null,
@@ -3451,6 +3546,13 @@ pub fn eraseDisplay(
 
             // All lines above
             if (self.screens.active.cursor.y > 0) {
+                self.invalidateTerminalUnitBoundaryRows(
+                    self.screens.active,
+                    .{ .active = .{ .y = 0 } },
+                    .{ .active = .{
+                        .y = self.screens.active.cursor.y - 1,
+                    } },
+                );
                 self.screens.active.clearRows(
                     .{ .active = .{ .y = 0 } },
                     .{ .active = .{ .y = self.screens.active.cursor.y - 1 } },
@@ -3496,6 +3598,11 @@ pub fn decaln(self: *Terminal) !void {
 
     // Use clearRows instead of eraseDisplay because we must NOT respect
     // protected attributes here.
+    self.invalidateTerminalUnitBoundaryRows(
+        self.screens.active,
+        .{ .active = .{} },
+        null,
+    );
     self.screens.active.clearRows(
         .{ .active = .{} },
         null,
@@ -3972,6 +4079,17 @@ pub fn resize(
     // and alt fails than the reverse.
     try tw.check(.primary_screen);
     const primary = self.screens.get(.primary).?;
+
+    // Column changes reflow the primary row space. A reservation describes
+    // one exact pre-reflow row, so invalidate it before rows are rebuilt.
+    if (self.cols != opts.cols) {
+        self.invalidateTerminalUnitBoundaryRows(
+            primary,
+            .{ .screen = .{} },
+            null,
+        );
+    }
+
     try primary.resize(.{
         .cols = opts.cols,
         .rows = opts.rows,
@@ -4410,6 +4528,1591 @@ test "Terminal: setPwd accepts its current value" {
     try testing.expectEqualStrings("file:///tmp", t.getPwd().?);
 }
 
+pub const TerminalUnitLifecycle = union(enum) {
+    open,
+    closed: Completion,
+    closed_unknown,
+
+    pub const Completion = struct {
+        exit_status: i32,
+        duration_ns: ?u64 = null,
+    };
+};
+
+pub const TerminalUnitRange = struct {
+    start_row: u64 = 0,
+    start_column: u32 = 0,
+    end_row: u64 = 0,
+    end_column: u32 = 0,
+    present: bool = false,
+
+    fn include(self: *TerminalUnitRange, row: u64, column: u32) void {
+        if (!self.present) {
+            self.* = .{
+                .start_row = row,
+                .start_column = column,
+                .end_row = row,
+                .end_column = column,
+                .present = true,
+            };
+            return;
+        }
+        self.end_row = row;
+        self.end_column = column;
+    }
+
+    fn intersects(self: TerminalUnitRange, first: u64, end: u64) bool {
+        return self.present and self.start_row < end and self.end_row >= first;
+    }
+};
+
+pub const TerminalUnit = struct {
+    unit_id: u64,
+    prompt: TerminalUnitRange,
+    command: TerminalUnitRange,
+    output: TerminalUnitRange,
+    lifecycle: TerminalUnitLifecycle,
+    command_start_pwd: ?[]u8,
+    leading_boundary_rows: u8,
+    trailing_boundary_rows: u8,
+};
+
+const TerminalUnitRanges = struct {
+    prompt: TerminalUnitRange = .{},
+    command: TerminalUnitRange = .{},
+    output: TerminalUnitRange = .{},
+};
+
+pub const TerminalUnitSnapshot = struct {
+    alloc: Allocator,
+    row_space_revision: u64,
+    units: []TerminalUnit,
+    truncated: bool,
+
+    pub fn deinit(self: *TerminalUnitSnapshot, _: Allocator) void {
+        for (self.units) |unit| {
+            if (unit.command_start_pwd) |pwd_| self.alloc.free(pwd_);
+        }
+        self.alloc.free(self.units);
+        self.* = undefined;
+    }
+};
+
+pub const TerminalUnitText = struct {
+    alloc: Allocator,
+    command: ?[:0]u8,
+    output: ?[:0]u8,
+
+    pub fn deinit(self: TerminalUnitText, _: Allocator) void {
+        if (self.command) |command| self.alloc.free(command);
+        if (self.output) |output| self.alloc.free(output);
+    }
+};
+
+pub const TerminalUnitSnapshotError = Allocator.Error || error{
+    InvalidWindow,
+};
+
+pub const TerminalUnitTextError = Allocator.Error || error{
+    StaleRevision,
+    InvalidUnit,
+    NotClosed,
+    NotRetained,
+};
+
+fn terminalUnitPinBackward(
+    self: *Terminal,
+    unit_id: u64,
+) ?PageList.Pin {
+    var prompts = self.screens.active.cursor.page_pin.promptIterator(
+        .left_up,
+        null,
+    );
+    while (prompts.next()) |prompt| {
+        const page = prompt.node.page();
+        if (page.terminalUnitId(prompt.rowAndCell().row) == unit_id)
+            return prompt;
+    }
+    return null;
+}
+
+/// Returns true when the row `pin` refers to paints no glyphs, meaning a
+/// boundary rule or label drawn across it cannot occlude terminal content.
+fn terminalUnitRowIsBlank(pin: PageList.Pin) bool {
+    const page = pin.node.page();
+    return !Cell.rendersGlyphAny(page.getCells(pin.rowAndCell().row));
+}
+
+/// Resolves a nearby absolute row by stepping from the unit marker already in
+/// hand. This keeps snapshot work proportional to the unit window rather than
+/// repeatedly walking from the top of scrollback.
+fn terminalUnitBoundaryRowFrom(
+    from: PageList.Pin,
+    from_row: u64,
+    target_row: u64,
+) bool {
+    const target = if (target_row >= from_row)
+        from.down(std.math.cast(usize, target_row - from_row) orelse
+            return false)
+    else
+        from.up(std.math.cast(usize, from_row - target_row) orelse
+            return false);
+    const pin = target orelse return false;
+    return pin.rowAndCell().row.terminal_unit_boundary and
+        terminalUnitRowIsBlank(pin);
+}
+
+const TerminalUnitBoundaryReservation = struct {
+    pin: PageList.Pin,
+    advance_cursor: bool,
+};
+
+/// Returns the actual blank row that can be reserved before the next prompt.
+///
+/// When output already ended with a blank row, that existing row is reused.
+/// Otherwise the current blank row is marked before `index()` advances the
+/// prompt. Null means the grid cannot honor a reservation without risking
+/// terminal content.
+fn terminalUnitBoundaryReservation(
+    self: *const Terminal,
+) ?TerminalUnitBoundaryReservation {
+    // `index()` only creates a row inside a full-screen scrolling region.
+    // Within DECSTBM it scrolls a subregion, shifting rows a TUI still owns,
+    // and outside the region on the last row it does nothing at all while the
+    // caller would still believe a row appeared.
+    if (self.scrolling_region.top != 0 or
+        self.scrolling_region.bottom != self.rows - 1 or
+        self.scrolling_region.left != 0 or
+        self.scrolling_region.right != self.cols - 1) return null;
+
+    const screen = self.screens.active;
+
+    // Top of the screen: the preceding unit was erased (`clear`) or never
+    // existed, so a reserved row would only indent the first prompt.
+    if (screen.cursor.y == 0) return null;
+
+    // `index()` leaves the *current* row behind as the boundary row. A command
+    // that repositioned its cursor above its own output leaves glyphs there,
+    // and a rule drawn through them is the defect this guard prevents.
+    const current = screen.cursor.page_pin.*;
+    if (!terminalUnitRowIsBlank(current)) return null;
+
+    // Already earned: output that ended with its own blank row supplies the
+    // boundary for free.
+    return switch (current.upOverflow(1)) {
+        .overflow => .{
+            .pin = current,
+            .advance_cursor = true,
+        },
+        .offset => |above| if (terminalUnitRowIsBlank(above))
+            .{
+                .pin = above,
+                .advance_cursor = false,
+            }
+        else
+            .{
+                .pin = current,
+                .advance_cursor = true,
+            },
+    };
+}
+
+fn invalidateTerminalUnitBoundaryRow(self: *Terminal, row: *Row) void {
+    if (!row.terminal_unit_boundary) return;
+    row.terminal_unit_boundary = false;
+    self.advanceTerminalUnitActivity();
+}
+
+fn invalidateTerminalUnitBoundaryRows(
+    self: *Terminal,
+    screen: *Screen,
+    tl: point.Point,
+    bl: ?point.Point,
+) void {
+    var invalidated = false;
+    var it = screen.pages.pageIterator(.right_down, tl, bl);
+    while (it.next()) |chunk| {
+        for (chunk.rows()) |*row| {
+            if (!row.terminal_unit_boundary) continue;
+            row.terminal_unit_boundary = false;
+            invalidated = true;
+        }
+    }
+    if (invalidated) self.advanceTerminalUnitActivity();
+}
+
+fn closeOpenTerminalUnitUnknown(self: *Terminal) void {
+    if (self.screens.active_key != .primary) return;
+    const unit_id = self.terminal_unit_open_id orelse return;
+    self.terminal_unit_open_id = null;
+    const prompt = self.terminalUnitPinBackward(unit_id) orelse return;
+    const page = prompt.node.page();
+    const data = page.terminalUnitDataMut(prompt.rowAndCell().row) orelse return;
+    if (data.lifecycle == .open) {
+        data.lifecycle = .closed_unknown;
+        self.terminal_unit_boundary_pending = true;
+        self.advanceTerminalUnitActivity();
+    }
+}
+
+fn startTerminalUnit(self: *Terminal) void {
+    if (self.screens.active_key != .primary) return;
+    self.closeOpenTerminalUnitUnknown();
+
+    var prompts = self.screens.active.cursor.page_pin.promptIterator(
+        .left_up,
+        null,
+    );
+    const prompt = prompts.next() orelse return;
+    const prompt_page = prompt.node.page();
+    const prompt_row = prompt.rowAndCell().row;
+    if (prompt_row.semantic_prompt != .prompt) return;
+
+    var unit_id = self.terminal_unit_next_id;
+    self.terminal_unit_next_id +%= 1;
+    if (unit_id == 0) {
+        unit_id = self.terminal_unit_next_id;
+        self.terminal_unit_next_id +%= 1;
+    }
+
+    prompt_page.setTerminalUnit(
+        prompt_row,
+        unit_id,
+        // A remote shell's OSC 7 is rejected as non-local, which leaves `pwd`
+        // holding a stale *local* path. Stamping that would label remote work
+        // with a directory the command never ran in, so report none instead.
+        if (self.flags.pwd_remote) null else self.getPwd(),
+    ) catch return;
+    self.terminal_unit_open_id = unit_id;
+    self.advanceTerminalUnitActivity();
+}
+
+fn finishTerminalUnit(self: *Terminal, exit_status: ?i32) void {
+    if (self.screens.active_key != .primary) return;
+    const unit_id = self.terminal_unit_open_id orelse return;
+    self.terminal_unit_open_id = null;
+    const prompt = self.terminalUnitPinBackward(unit_id) orelse return;
+    const page = prompt.node.page();
+    const data = page.terminalUnitDataMut(prompt.rowAndCell().row) orelse return;
+    if (exit_status == null) {
+        data.lifecycle = .closed_unknown;
+        self.terminal_unit_boundary_pending = true;
+        self.advanceTerminalUnitActivity();
+        return;
+    }
+    data.duration_ns = if (data.started_at) |started|
+        if (std.time.Instant.now()) |now| now.since(started) else |_| null
+    else
+        null;
+    data.exit_status = exit_status.?;
+    data.lifecycle = .closed;
+    self.terminal_unit_boundary_pending = true;
+    self.advanceTerminalUnitActivity();
+}
+
+fn terminalUnitLifecycle(
+    data: *const pagepkg.TerminalUnitData,
+) TerminalUnitLifecycle {
+    return switch (data.lifecycle) {
+        .open => .open,
+        .closed => .{ .closed = .{
+            .exit_status = data.exit_status,
+            .duration_ns = data.duration_ns,
+        } },
+        .closed_unknown => .closed_unknown,
+    };
+}
+
+fn deriveTerminalUnitRanges(
+    self: *Terminal,
+    prompt: PageList.Pin,
+    unit_id: u64,
+) ?TerminalUnitRanges {
+    const screen = self.screens.active;
+    const marker_page = prompt.node.page();
+    if (marker_page.terminalUnitId(prompt.rowAndCell().row) != unit_id) return null;
+
+    var result: TerminalUnitRanges = .{};
+    var row_it = prompt.rowIterator(.right_down, null);
+    var first_row = true;
+    while (row_it.next()) |row_pin| {
+        const page = row_pin.node.page();
+        const row = row_pin.rowAndCell().row;
+        if (!first_row and
+            (page.terminalUnitId(row) != null or row.semantic_prompt == .prompt))
+        {
+            break;
+        }
+        const absolute = screen.pages.pointFromPin(.screen, row_pin) orelse return null;
+        const cells = page.getCells(row);
+        for (cells, 0..) |cell, x| {
+            if (cell.isEmpty()) continue;
+            const x_u32: u32 = @intCast(x);
+            switch (cell.semantic_content) {
+                .prompt => result.prompt.include(absolute.screen.y, x_u32),
+                .input => result.command.include(absolute.screen.y, x_u32),
+                .output => result.output.include(absolute.screen.y, x_u32),
+            }
+        }
+        first_row = false;
+    }
+
+    if (!result.prompt.present or !result.command.present) return null;
+    return result;
+}
+
+pub fn terminalUnitSnapshot(
+    self: *Terminal,
+    alloc: Allocator,
+    first_absolute_row: u64,
+    row_count: u64,
+    maximum_units: usize,
+) TerminalUnitSnapshotError!TerminalUnitSnapshot {
+    const end = std.math.add(
+        u64,
+        first_absolute_row,
+        row_count,
+    ) catch return error.InvalidWindow;
+    const revision = self.screens.active.pages.scrollbar().row_space_revision;
+    var units: std.ArrayList(TerminalUnit) = .empty;
+    errdefer {
+        for (units.items) |unit| {
+            if (unit.command_start_pwd) |pwd_| alloc.free(pwd_);
+        }
+        units.deinit(alloc);
+    }
+
+    if (self.screens.active_key != .primary or row_count == 0) return .{
+        .alloc = alloc,
+        .row_space_revision = revision,
+        .units = try units.toOwnedSlice(alloc),
+        .truncated = false,
+    };
+
+    const total: u64 = @intCast(self.screens.active.pages.scrollbar().total);
+    var y = first_absolute_row;
+    if (first_absolute_row < total) {
+        const first_y = std.math.cast(u32, first_absolute_row) orelse
+            std.math.maxInt(u32);
+        if (self.screens.active.pages.pin(.{
+            .screen = .{ .y = first_y },
+        })) |first_pin| {
+            var prior_prompts = first_pin.promptIterator(.left_up, null);
+            while (prior_prompts.next()) |prior| {
+                const prior_page = prior.node.page();
+                if (prior_page.terminalUnitId(prior.rowAndCell().row) == null)
+                    continue;
+                const prior_point = self.screens.active.pages.pointFromPin(
+                    .screen,
+                    prior,
+                ) orelse break;
+                y = prior_point.screen.y;
+                break;
+            }
+        }
+    }
+    var truncated = false;
+    // Resolve the first row once and step from there. `pages.pin(.{ .screen =
+    // ... })` walks from the top of scrollback, so resolving every row that way
+    // makes this loop O(window × scrollback) rather than O(window).
+    var maybe_pin = if (std.math.cast(u32, y)) |first_y|
+        self.screens.active.pages.pin(.{ .screen = .{ .y = first_y } })
+    else
+        null;
+    while (y < @min(end, total)) : (y += 1) {
+        const pin = maybe_pin orelse break;
+        defer maybe_pin = pin.down(1);
+        const page = pin.node.page();
+        const unit_id = page.terminalUnitId(pin.rowAndCell().row) orelse continue;
+        const data = page.terminalUnitData(pin.rowAndCell().row) orelse continue;
+        const ranges = self.deriveTerminalUnitRanges(pin, unit_id) orelse continue;
+        const unit_end = if (ranges.output.present)
+            ranges.output
+        else
+            ranges.command;
+        if (!ranges.prompt.intersects(first_absolute_row, end) and
+            !ranges.command.intersects(first_absolute_row, end) and
+            !unit_end.intersects(first_absolute_row, end))
+        {
+            continue;
+        }
+        if (units.items.len == maximum_units) {
+            truncated = true;
+            continue;
+        }
+
+        const pwd_copy = if (data.pwd) |pwd_|
+            try alloc.dupe(u8, pwd_.slice(page.memory))
+        else
+            null;
+        errdefer if (pwd_copy) |pwd_| alloc.free(pwd_);
+        // Boundary rows are derived from the live grid rather than stored on
+        // the unit. A stored count survives the row it described: reflow,
+        // erase, eviction, and prompt redraws can all leave glyphs where the
+        // count still claims blank space. Deriving cannot go stale.
+        const lifecycle = terminalUnitLifecycle(data);
+        const leading_boundary_rows: u8 = @intFromBool(
+            ranges.prompt.start_row > 0 and
+                terminalUnitBoundaryRowFrom(
+                    pin,
+                    y,
+                    ranges.prompt.start_row - 1,
+                ),
+        );
+        const trailing_boundary_rows: u8 = @intFromBool(switch (lifecycle) {
+            .open => false,
+            .closed, .closed_unknown => terminalUnitBoundaryRowFrom(
+                pin,
+                y,
+                unit_end.end_row +| 1,
+            ),
+        });
+        try units.append(alloc, .{
+            .unit_id = unit_id,
+            .prompt = ranges.prompt,
+            .command = ranges.command,
+            .output = ranges.output,
+            .lifecycle = lifecycle,
+            .command_start_pwd = pwd_copy,
+            .leading_boundary_rows = leading_boundary_rows,
+            .trailing_boundary_rows = trailing_boundary_rows,
+        });
+    }
+
+    return .{
+        .alloc = alloc,
+        .row_space_revision = revision,
+        .units = try units.toOwnedSlice(alloc),
+        .truncated = truncated,
+    };
+}
+
+fn terminalUnitSemanticText(
+    self: *Terminal,
+    alloc: Allocator,
+    prompt: PageList.Pin,
+    unit_id: u64,
+    ranges: TerminalUnitRanges,
+    target: Cell.SemanticContent,
+) Allocator.Error![:0]u8 {
+    var writer: std.Io.Writer.Allocating = .init(alloc);
+    defer writer.deinit();
+
+    var row_it = prompt.rowIterator(.right_down, null);
+    var first_row = true;
+    var emitted = false;
+    var output_started = false;
+    var pending_hard_breaks: usize = 0;
+    while (row_it.next()) |row_pin| {
+        const page = row_pin.node.page();
+        const row = row_pin.rowAndCell().row;
+        if (!first_row and
+            (page.terminalUnitId(row) != null or row.semantic_prompt == .prompt))
+        {
+            if (target == .output) {
+                writer.writer.splatByteAll(
+                    '\n',
+                    pending_hard_breaks,
+                ) catch return error.OutOfMemory;
+            }
+            break;
+        }
+        const absolute = self.screens.active.pages.pointFromPin(
+            .screen,
+            row_pin,
+        ) orelse break;
+        const cells = page.getCells(row);
+        const output_start_x: usize = if (target != .output)
+            0
+        else if (absolute.screen.y < ranges.command.end_row)
+            cells.len
+        else if (absolute.screen.y == ranges.command.end_row)
+            @min(@as(usize, ranges.command.end_column) + 1, cells.len)
+        else
+            0;
+        if (target == .output and
+            absolute.screen.y == ranges.command.end_row)
+            output_started = true;
+
+        var x: usize = 0;
+        var emitted_on_row = false;
+        while (x < cells.len) {
+            while (x < cells.len and
+                (x < output_start_x or
+                    cells[x].semantic_content != target or
+                    cells[x].isEmpty()))
+            {
+                x += 1;
+            }
+            if (x == cells.len) break;
+            const start_x = x;
+            while (x + 1 < cells.len and
+                cells[x + 1].semantic_content == target and
+                !cells[x + 1].isEmpty())
+            {
+                x += 1;
+            }
+
+            if ((emitted or (target == .output and output_started)) and
+                !emitted_on_row)
+            {
+                writer.writer.splatByteAll(
+                    '\n',
+                    pending_hard_breaks,
+                ) catch return error.OutOfMemory;
+            }
+            pending_hard_breaks = 0;
+            const text = try self.screens.active.selectionString(alloc, .{
+                .sel = Selection.init(
+                    .{ .node = row_pin.node, .y = row_pin.y, .x = @intCast(start_x) },
+                    .{ .node = row_pin.node, .y = row_pin.y, .x = @intCast(x) },
+                    false,
+                ),
+                .trim = false,
+            });
+            defer alloc.free(text);
+            writer.writer.writeAll(text) catch return error.OutOfMemory;
+            emitted = true;
+            emitted_on_row = true;
+            x += 1;
+        }
+
+        const cursor = self.screens.active.cursor.page_pin.*;
+        if (row_pin.node == cursor.node and row_pin.y == cursor.y) {
+            if (target == .output) {
+                writer.writer.splatByteAll(
+                    '\n',
+                    pending_hard_breaks,
+                ) catch return error.OutOfMemory;
+            }
+            break;
+        }
+
+        if ((emitted or (target == .output and output_started)) and !row.wrap)
+            pending_hard_breaks += 1;
+        first_row = false;
+    }
+
+    _ = unit_id;
+    return try writer.toOwnedSliceSentinel(0);
+}
+
+fn terminalUnitPin(
+    self: *Terminal,
+    unit_id: u64,
+) ?PageList.Pin {
+    var rows_it = self.screens.active.pages.rowIterator(
+        .right_down,
+        .{ .screen = .{} },
+        null,
+    );
+    while (rows_it.next()) |pin| {
+        const page = pin.node.page();
+        if (page.terminalUnitId(pin.rowAndCell().row) == unit_id) return pin;
+    }
+    return null;
+}
+
+pub fn terminalUnitText(
+    self: *Terminal,
+    alloc: Allocator,
+    row_space_revision: u64,
+    unit_id: u64,
+) TerminalUnitTextError!TerminalUnitText {
+    const revision = self.screens.active.pages.scrollbar().row_space_revision;
+    if (revision != row_space_revision) return error.StaleRevision;
+    if (self.screens.active_key != .primary) return error.NotRetained;
+    if (unit_id == 0 or unit_id >= self.terminal_unit_next_id)
+        return error.InvalidUnit;
+    const prompt = self.terminalUnitPin(unit_id) orelse return error.NotRetained;
+    const data = prompt.node.page().terminalUnitData(
+        prompt.rowAndCell().row,
+    ) orelse return error.NotRetained;
+    if (data.lifecycle == .open) return error.NotClosed;
+    const ranges = self.deriveTerminalUnitRanges(prompt, unit_id) orelse
+        return error.NotRetained;
+
+    const command = try self.terminalUnitSemanticText(
+        alloc,
+        prompt,
+        unit_id,
+        ranges,
+        .input,
+    );
+    errdefer alloc.free(command);
+    const output = try self.terminalUnitSemanticText(
+        alloc,
+        prompt,
+        unit_id,
+        ranges,
+        .output,
+    );
+    return .{
+        .alloc = alloc,
+        .command = command,
+        .output = output,
+    };
+}
+
+test "terminal-unit snapshot captures semantic ranges lifecycle and command-start pwd" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 40, .rows = 8 });
+    defer t.deinit(alloc);
+
+    try t.setPwd("/work/a");
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("printf hi");
+    try t.semanticPrompt(.init(.end_input_start_output));
+    try t.setPwd("/work/b");
+    try t.printString("\nhi\n");
+    try t.semanticPrompt(.{
+        .action = .end_command,
+        .options_unvalidated = "0",
+    });
+
+    var snapshot = try t.terminalUnitSnapshot(alloc, 0, 8, 8);
+    defer snapshot.deinit(alloc);
+
+    try testing.expectEqual(@as(usize, 1), snapshot.units.len);
+    const unit = snapshot.units[0];
+    try testing.expectEqualStrings("/work/a", unit.command_start_pwd.?);
+    try testing.expectEqual(@as(i32, 0), unit.lifecycle.closed.exit_status);
+
+    const text = try t.terminalUnitText(
+        alloc,
+        snapshot.row_space_revision,
+        unit.unit_id,
+    );
+    defer text.deinit(alloc);
+    try testing.expectEqualStrings("printf hi", text.command.?);
+    try testing.expectEqualStrings("\nhi\n", text.output.?);
+}
+
+test "terminal-unit boundary reserves a blank row before the next prompt" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 40, .rows = 12 });
+    defer t.deinit(alloc);
+
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("echo one");
+    try t.semanticPrompt(.init(.end_input_start_output));
+    try t.printString("\none\n");
+    try t.semanticPrompt(.{
+        .action = .end_command,
+        .options_unvalidated = "0",
+    });
+
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("echo two");
+    try t.semanticPrompt(.init(.end_input_start_output));
+
+    var snapshot = try t.terminalUnitSnapshot(alloc, 0, 12, 8);
+    defer snapshot.deinit(alloc);
+
+    try testing.expectEqual(@as(usize, 2), snapshot.units.len);
+    const first = snapshot.units[0];
+    const second = snapshot.units[1];
+    try testing.expectEqual(@as(u8, 0), first.leading_boundary_rows);
+    try testing.expectEqual(@as(u8, 1), second.leading_boundary_rows);
+    try testing.expectEqual(@as(u8, 1), first.trailing_boundary_rows);
+    try testing.expectEqual(@as(u8, 0), second.trailing_boundary_rows);
+    try testing.expect(first.output.present);
+    try testing.expectEqual(
+        first.output.end_row + 2,
+        second.prompt.start_row,
+    );
+
+    const boundary_row = t.screens.active.pages.pin(.{
+        .screen = .{ .y = @intCast(first.output.end_row + 1) },
+    }) orelse return error.TestUnexpectedResult;
+    const boundary_page = boundary_row.node.page();
+    for (boundary_page.getCells(boundary_row.rowAndCell().row)) |cell| {
+        try testing.expect(cell.isEmpty());
+    }
+}
+
+test "terminal-unit boundary is not claimed across an empty prompt" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 40, .rows = 12 });
+    defer t.deinit(alloc);
+
+    // One real command, which earns its boundary row.
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("echo one");
+    try t.semanticPrompt(.init(.end_input_start_output));
+    try t.printString("\none\n");
+    try t.semanticPrompt(.{
+        .action = .end_command,
+        .options_unvalidated = "0",
+    });
+
+    // Enter on an empty prompt. No command runs, so the shell reports a
+    // command end with no exit status and no unit is open to close. The next
+    // prompt must not inherit the previous command's boundary row.
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("\n");
+    try t.semanticPrompt(.init(.end_command));
+
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("echo two");
+    try t.semanticPrompt(.init(.end_input_start_output));
+
+    var snapshot = try t.terminalUnitSnapshot(alloc, 0, 12, 8);
+    defer snapshot.deinit(alloc);
+
+    try testing.expectEqual(@as(usize, 2), snapshot.units.len);
+    const second = snapshot.units[1];
+
+    // The row above the second unit's prompt holds the empty prompt's glyphs,
+    // so there is no boundary row to draw in.
+    try testing.expectEqual(@as(u8, 0), second.leading_boundary_rows);
+}
+
+test "terminal-unit boundary reuses a blank row the output already produced" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 40, .rows = 12 });
+    defer t.deinit(alloc);
+
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("echo one");
+    try t.semanticPrompt(.init(.end_input_start_output));
+
+    // Output ends with its own blank row.
+    try t.printString("\none\n\n");
+    try t.semanticPrompt(.{
+        .action = .end_command,
+        .options_unvalidated = "0",
+    });
+
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("echo two");
+    try t.semanticPrompt(.init(.end_input_start_output));
+
+    var snapshot = try t.terminalUnitSnapshot(alloc, 0, 12, 8);
+    defer snapshot.deinit(alloc);
+
+    try testing.expectEqual(@as(usize, 2), snapshot.units.len);
+    const first = snapshot.units[0];
+    const second = snapshot.units[1];
+
+    // Both edges still describe a boundary row...
+    try testing.expectEqual(@as(u8, 1), first.trailing_boundary_rows);
+    try testing.expectEqual(@as(u8, 1), second.leading_boundary_rows);
+
+    // ...but no second row was consumed to provide it. A blank row the output
+    // already ended with is not part of the output range, so exactly one row
+    // separates the two units.
+    try testing.expect(first.output.present);
+    try testing.expectEqual(
+        first.output.end_row + 2,
+        second.prompt.start_row,
+    );
+}
+
+test "terminal-unit boundary invalidates on visible write without ordinary churn" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 40, .rows = 12 });
+    defer t.deinit(alloc);
+
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("echo one");
+    try t.semanticPrompt(.init(.end_input_start_output));
+    try t.printString("\none\n");
+    try t.semanticPrompt(.{
+        .action = .end_command,
+        .options_unvalidated = "0",
+    });
+
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("echo two");
+    try t.semanticPrompt(.init(.end_input_start_output));
+
+    var before = try t.terminalUnitSnapshot(alloc, 0, 12, 8);
+    defer before.deinit(alloc);
+    try testing.expectEqual(@as(usize, 2), before.units.len);
+    try testing.expectEqual(@as(u8, 1), before.units[0].trailing_boundary_rows);
+    try testing.expectEqual(@as(u8, 1), before.units[1].leading_boundary_rows);
+
+    // A reservation elsewhere in the grid must not turn normal terminal
+    // output into a per-byte snapshot refresh stream.
+    t.setCursorPos(12, 1);
+    const unrelated_activity = t.terminalUnitActivity();
+    try t.printSlice(&.{ 'o', 'r', 'd', 'i', 'n', 'a', 'r', 'y' });
+    try testing.expectEqual(
+        unrelated_activity,
+        t.terminalUnitActivity(),
+    );
+
+    const boundary_row = before.units[0].output.end_row + 1;
+    t.setCursorPos(std.math.cast(usize, boundary_row + 1).?, 1);
+    const activity = t.terminalUnitActivity();
+    try t.printSlice(&.{
+        'o', 'v', 'e', 'r', 'w',
+        'r', 'i', 't', 't', 'e',
+        'n',
+    });
+    try testing.expect(activity != t.terminalUnitActivity());
+
+    var overwritten = try t.terminalUnitSnapshot(alloc, 0, 12, 8);
+    defer overwritten.deinit(alloc);
+    try testing.expectEqual(
+        @as(u8, 0),
+        overwritten.units[0].trailing_boundary_rows,
+    );
+    try testing.expectEqual(
+        @as(u8, 0),
+        overwritten.units[1].leading_boundary_rows,
+    );
+
+    // Once the one reservation transition has been reported, further
+    // ordinary writes on the same row do not create snapshot churn.
+    const after_invalidation = t.terminalUnitActivity();
+    try t.printSlice(&.{ ' ', 'a', 'g', 'a', 'i', 'n' });
+    try testing.expectEqual(after_invalidation, t.terminalUnitActivity());
+}
+
+test "terminal-unit boundary invalidates when its row is erased" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 40, .rows = 12 });
+    defer t.deinit(alloc);
+
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("echo one");
+    try t.semanticPrompt(.init(.end_input_start_output));
+    try t.printString("\none\n");
+    try t.semanticPrompt(.{
+        .action = .end_command,
+        .options_unvalidated = "0",
+    });
+
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("echo two");
+    try t.semanticPrompt(.init(.end_input_start_output));
+
+    var before = try t.terminalUnitSnapshot(alloc, 0, 12, 8);
+    defer before.deinit(alloc);
+    try testing.expectEqual(@as(usize, 2), before.units.len);
+    try testing.expectEqual(@as(u8, 1), before.units[0].trailing_boundary_rows);
+
+    const boundary_row = before.units[0].output.end_row + 1;
+    t.setCursorPos(std.math.cast(usize, boundary_row + 1).?, 1);
+    const activity = t.terminalUnitActivity();
+    t.eraseLine(.complete, false);
+    try testing.expect(activity != t.terminalUnitActivity());
+
+    var erased = try t.terminalUnitSnapshot(alloc, 0, 12, 8);
+    defer erased.deinit(alloc);
+    try testing.expectEqual(@as(u8, 0), erased.units[0].trailing_boundary_rows);
+    try testing.expectEqual(@as(u8, 0), erased.units[1].leading_boundary_rows);
+}
+
+test "terminal-unit boundary is not claimed when the cursor sits on output" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 40, .rows = 12 });
+    defer t.deinit(alloc);
+
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("progress");
+    try t.semanticPrompt(.init(.end_input_start_output));
+    try t.printString("\nalpha\nbeta\n");
+
+    // Programs that redraw in place (progress bars, spinners) commonly finish
+    // with the cursor above their own last output row. `index()` would move
+    // the cursor onto a row that still holds glyphs, so no row is reserved.
+    t.setCursorPos(2, 1);
+    try t.semanticPrompt(.{
+        .action = .end_command,
+        .options_unvalidated = "0",
+    });
+
+    const cursor_y_before = t.screens.active.cursor.y;
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try testing.expectEqual(cursor_y_before, t.screens.active.cursor.y);
+
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("echo two");
+    try t.semanticPrompt(.init(.end_input_start_output));
+
+    var snapshot = try t.terminalUnitSnapshot(alloc, 0, 12, 8);
+    defer snapshot.deinit(alloc);
+
+    // Neither edge may claim breathing room that does not exist.
+    for (snapshot.units) |unit| {
+        try testing.expectEqual(@as(u8, 0), unit.leading_boundary_rows);
+        try testing.expectEqual(@as(u8, 0), unit.trailing_boundary_rows);
+    }
+}
+
+test "terminal-unit boundary is not reserved at the top of the screen" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 40, .rows = 12 });
+    defer t.deinit(alloc);
+
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("clear");
+    try t.semanticPrompt(.init(.end_input_start_output));
+    try t.printString("\n");
+    try t.semanticPrompt(.{
+        .action = .end_command,
+        .options_unvalidated = "0",
+    });
+
+    // What `clear` does: erase the screen and home the cursor. There is no
+    // preceding content to separate from, so reserving would only indent the
+    // first prompt by a blank line.
+    t.eraseDisplay(.complete, false);
+    t.setCursorPos(1, 1);
+
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try testing.expectEqual(@as(size.CellCountInt, 0), t.screens.active.cursor.y);
+}
+
+test "terminal-unit boundary is not reserved inside a scrolling region" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 40, .rows = 12 });
+    defer t.deinit(alloc);
+
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("tui");
+    try t.semanticPrompt(.init(.end_input_start_output));
+    try t.printString("\nalpha\n");
+    try t.semanticPrompt(.{
+        .action = .end_command,
+        .options_unvalidated = "0",
+    });
+
+    // A program that exits without restoring DECSTBM leaves the shell running
+    // inside a subregion. There `index()` either scrolls rows the region does
+    // not own or does nothing at all, so we must not claim a row.
+    t.setTopAndBottomMargin(1, 6);
+
+    const cursor_y_before = t.screens.active.cursor.y;
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try testing.expectEqual(cursor_y_before, t.screens.active.cursor.y);
+}
+
+test "terminal-unit boundary does not survive an alternate screen excursion" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 40, .rows = 12 });
+    defer t.deinit(alloc);
+
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("echo one");
+    try t.semanticPrompt(.init(.end_input_start_output));
+    try t.printString("\none\n");
+    try t.semanticPrompt(.{
+        .action = .end_command,
+        .options_unvalidated = "0",
+    });
+
+    // The completed unit's pending boundary belongs to the primary screen it
+    // finished on. An alternate-screen excursion in between must not hand it
+    // to some later, unrelated prompt.
+    _ = try t.switchScreen(.alternate);
+    _ = try t.switchScreen(.primary);
+    try testing.expect(!t.terminal_unit_boundary_pending);
+
+    const cursor_y_before = t.screens.active.cursor.y;
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try testing.expectEqual(cursor_y_before, t.screens.active.cursor.y);
+}
+
+test "terminal-unit alternate-screen semantics do not close primary unit" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 40, .rows = 12 });
+    defer t.deinit(alloc);
+
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("long-running");
+    try t.semanticPrompt(.init(.end_input_start_output));
+    try t.printString("\nprimary output");
+    const unit_id = t.terminal_unit_open_id.?;
+
+    _ = try t.switchScreen(.alternate);
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.semanticPrompt(.{
+        .action = .end_command,
+        .options_unvalidated = "99",
+    });
+    try testing.expectEqual(@as(?u64, unit_id), t.terminal_unit_open_id);
+
+    _ = try t.switchScreen(.primary);
+    try t.semanticPrompt(.{
+        .action = .end_command,
+        .options_unvalidated = "7",
+    });
+
+    var snapshot = try t.terminalUnitSnapshot(alloc, 0, 12, 8);
+    defer snapshot.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), snapshot.units.len);
+    try testing.expectEqual(unit_id, snapshot.units[0].unit_id);
+    try testing.expectEqual(
+        @as(i32, 7),
+        snapshot.units[0].lifecycle.closed.exit_status,
+    );
+}
+
+test "terminal-unit command-start directory is absent when pwd is remote" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 40, .rows = 12 });
+    defer t.deinit(alloc);
+
+    try t.setPwd("/work/local");
+
+    // OSC 7 from a non-local host is rejected upstream, which leaves the
+    // stored pwd describing the local machine rather than the shell that is
+    // actually running commands (an SSH session).
+    t.flags.pwd_remote = true;
+
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("ls");
+    try t.semanticPrompt(.init(.end_input_start_output));
+    try t.printString("\nalpha\n");
+    try t.semanticPrompt(.{
+        .action = .end_command,
+        .options_unvalidated = "0",
+    });
+
+    var snapshot = try t.terminalUnitSnapshot(alloc, 0, 12, 8);
+    defer snapshot.deinit(alloc);
+
+    try testing.expectEqual(@as(usize, 1), snapshot.units.len);
+    try testing.expect(snapshot.units[0].command_start_pwd == null);
+}
+
+test "terminal-unit output text preserves leading and trailing hard newlines" {
+    const alloc = testing.allocator;
+
+    {
+        var t = try init(testing.io, alloc, .{ .cols = 40, .rows = 8 });
+        defer t.deinit(alloc);
+
+        try t.semanticPrompt(.init(.fresh_line_new_prompt));
+        try t.printString("$ ");
+        try t.semanticPrompt(.init(.end_prompt_start_input));
+        try t.printString("one");
+        try t.semanticPrompt(.init(.end_input_start_output));
+        try t.printString("\nalpha\n");
+        try t.semanticPrompt(.{
+            .action = .end_command,
+            .options_unvalidated = "0",
+        });
+
+        var snapshot = try t.terminalUnitSnapshot(alloc, 0, 8, 8);
+        defer snapshot.deinit(alloc);
+        const text = try t.terminalUnitText(
+            alloc,
+            snapshot.row_space_revision,
+            snapshot.units[0].unit_id,
+        );
+        defer text.deinit(alloc);
+        try testing.expectEqualStrings("\nalpha\n", text.output.?);
+    }
+
+    {
+        var t = try init(testing.io, alloc, .{ .cols = 40, .rows = 8 });
+        defer t.deinit(alloc);
+
+        try t.semanticPrompt(.init(.fresh_line_new_prompt));
+        try t.printString("$ ");
+        try t.semanticPrompt(.init(.end_prompt_start_input));
+        try t.printString("two");
+        try t.semanticPrompt(.init(.end_input_start_output));
+        try t.printString("alpha\n\n\n");
+        try t.semanticPrompt(.{
+            .action = .end_command,
+            .options_unvalidated = "0",
+        });
+
+        var snapshot = try t.terminalUnitSnapshot(alloc, 0, 8, 8);
+        defer snapshot.deinit(alloc);
+        const text = try t.terminalUnitText(
+            alloc,
+            snapshot.row_space_revision,
+            snapshot.units[0].unit_id,
+        );
+        defer text.deinit(alloc);
+        try testing.expectEqualStrings("alpha\n\n\n", text.output.?);
+    }
+}
+
+test "terminal-unit snapshot distinguishes failed interrupted and unknown completion" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 40, .rows = 12 });
+    defer t.deinit(alloc);
+
+    const Fixture = struct {
+        command: []const u8,
+        exit_status: ?i32,
+    };
+    const fixtures = [_]Fixture{
+        .{ .command = "false", .exit_status = 1 },
+        .{ .command = "sleep 10", .exit_status = 130 },
+        .{ .command = "unknown", .exit_status = null },
+    };
+
+    for (fixtures) |fixture| {
+        try t.semanticPrompt(.init(.fresh_line_new_prompt));
+        try t.printString("$ ");
+        try t.semanticPrompt(.init(.end_prompt_start_input));
+        try t.printString(fixture.command);
+        try t.semanticPrompt(.init(.end_input_start_output));
+        try t.printString("\n");
+        if (fixture.exit_status) |exit_status| {
+            var option_buf: [16]u8 = undefined;
+            const options = try std.fmt.bufPrint(&option_buf, "{d}", .{exit_status});
+            try t.semanticPrompt(.{
+                .action = .end_command,
+                .options_unvalidated = options,
+            });
+        }
+    }
+    // A following prompt safely closes the final unit without inventing
+    // completion metadata.
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+
+    var snapshot = try t.terminalUnitSnapshot(alloc, 0, 12, 8);
+    defer snapshot.deinit(alloc);
+
+    try testing.expectEqual(@as(usize, 3), snapshot.units.len);
+    try testing.expectEqual(@as(i32, 1), snapshot.units[0].lifecycle.closed.exit_status);
+    try testing.expectEqual(@as(i32, 130), snapshot.units[1].lifecycle.closed.exit_status);
+    try testing.expect(snapshot.units[2].lifecycle == .closed_unknown);
+}
+
+test "terminal-unit page marker survives reflow and reset fails closed" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 20, .rows = 6 });
+    defer t.deinit(alloc);
+
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("printf 1234567890");
+    try t.semanticPrompt(.init(.end_input_start_output));
+    try t.printString("\n1234567890\n");
+    try t.semanticPrompt(.{
+        .action = .end_command,
+        .options_unvalidated = "0",
+    });
+
+    try t.resize(alloc, .{ .cols = 10, .rows = 6 });
+    var reflowed = try t.terminalUnitSnapshot(alloc, 0, 6, 8);
+    defer reflowed.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), reflowed.units.len);
+    var marker_count: usize = 0;
+    var rows_it = t.screens.active.pages.rowIterator(
+        .right_down,
+        .{ .screen = .{} },
+        null,
+    );
+    while (rows_it.next()) |pin| {
+        const page = pin.node.page();
+        if (page.terminalUnitId(pin.rowAndCell().row) != null)
+            marker_count += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), marker_count);
+
+    t.fullReset();
+    var reset = try t.terminalUnitSnapshot(alloc, 0, 6, 8);
+    defer reset.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), reset.units.len);
+}
+
+test "terminal-unit command text excludes continuation prompt decoration" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 40, .rows = 8 });
+    defer t.deinit(alloc);
+
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("printf one\n");
+    try t.semanticPrompt(.{
+        .action = .prompt_start,
+        .options_unvalidated = "k=s",
+    });
+    try t.printString("> ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("two");
+    try t.semanticPrompt(.init(.end_input_start_output));
+    try t.semanticPrompt(.{
+        .action = .end_command,
+        .options_unvalidated = "0",
+    });
+
+    var snapshot = try t.terminalUnitSnapshot(alloc, 0, 8, 8);
+    defer snapshot.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), snapshot.units.len);
+
+    const text = try t.terminalUnitText(
+        alloc,
+        snapshot.row_space_revision,
+        snapshot.units[0].unit_id,
+    );
+    defer text.deinit(alloc);
+    try testing.expectEqualStrings("printf one\ntwo", text.command.?);
+}
+
+test "terminal-unit absolute row window does not clamp to active rows" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 40, .rows = 4 });
+    defer t.deinit(alloc);
+
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("true");
+    try t.semanticPrompt(.init(.end_input_start_output));
+    try t.semanticPrompt(.{
+        .action = .end_command,
+        .options_unvalidated = "0",
+    });
+
+    var snapshot = try t.terminalUnitSnapshot(alloc, 100, 5, 8);
+    defer snapshot.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), snapshot.units.len);
+}
+
+test "terminal-unit page marker owns identity without tracked pins" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 40, .rows = 6 });
+    defer t.deinit(alloc);
+
+    const tracked_before = t.screens.active.pages.countTrackedPins();
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("true");
+    try t.semanticPrompt(.init(.end_input_start_output));
+    try t.semanticPrompt(.{
+        .action = .end_command,
+        .options_unvalidated = "0",
+    });
+
+    var first = try t.terminalUnitSnapshot(alloc, 0, 6, 8);
+    defer first.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), first.units.len);
+    try testing.expectEqual(tracked_before, t.screens.active.pages.countTrackedPins());
+    try testing.expect(first.units[0].unit_id != 0);
+
+    try t.printString("\n");
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("false");
+    try t.semanticPrompt(.init(.end_input_start_output));
+    try t.semanticPrompt(.{
+        .action = .end_command,
+        .options_unvalidated = "1",
+    });
+
+    var second = try t.terminalUnitSnapshot(alloc, 0, 6, 8);
+    defer second.deinit(alloc);
+    try testing.expectEqual(@as(usize, 2), second.units.len);
+    try testing.expect(second.units[1].unit_id > second.units[0].unit_id);
+    try testing.expectEqual(tracked_before, t.screens.active.pages.countTrackedPins());
+}
+
+test "terminal-unit maximum zero reports truncation without returning units" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 40, .rows = 4 });
+    defer t.deinit(alloc);
+
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("true");
+    try t.semanticPrompt(.init(.end_input_start_output));
+    try t.semanticPrompt(.{
+        .action = .end_command,
+        .options_unvalidated = "0",
+    });
+
+    var snapshot = try t.terminalUnitSnapshot(alloc, 0, 4, 0);
+    defer snapshot.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), snapshot.units.len);
+    try testing.expect(snapshot.truncated);
+}
+
+test "terminal-unit missing or malformed completion status is closed unknown" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 40, .rows = 8 });
+    defer t.deinit(alloc);
+
+    const completions = [_][]const u8{ "", "not-a-status" };
+    for (completions) |completion| {
+        try t.semanticPrompt(.init(.fresh_line_new_prompt));
+        try t.printString("$ ");
+        try t.semanticPrompt(.init(.end_prompt_start_input));
+        try t.printString("statusless");
+        try t.semanticPrompt(.init(.end_input_start_output));
+        try t.semanticPrompt(.{
+            .action = .end_command,
+            .options_unvalidated = completion,
+        });
+        try t.printString("\n");
+    }
+
+    var snapshot = try t.terminalUnitSnapshot(alloc, 0, 8, 8);
+    defer snapshot.deinit(alloc);
+    try testing.expectEqual(@as(usize, 2), snapshot.units.len);
+    for (snapshot.units) |unit|
+        try testing.expect(unit.lifecycle == .closed_unknown);
+}
+
+test "terminal-unit snapshot includes predecessor whose output crosses window" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{
+        .cols = 20,
+        .rows = 4,
+        .max_scrollback = 100_000,
+    });
+    defer t.deinit(alloc);
+
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("long-output");
+    try t.semanticPrompt(.init(.end_input_start_output));
+    for (0..12) |i| {
+        var buf: [32]u8 = undefined;
+        const line = try std.fmt.bufPrint(&buf, "\nline-{d}", .{i});
+        try t.printString(line);
+    }
+    try t.semanticPrompt(.{
+        .action = .end_command,
+        .options_unvalidated = "0",
+    });
+
+    var all = try t.terminalUnitSnapshot(
+        alloc,
+        0,
+        @intCast(t.screens.active.pages.scrollbar().total),
+        8,
+    );
+    defer all.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), all.units.len);
+    const output = all.units[0].output;
+    try testing.expect(output.present);
+    try testing.expect(output.end_row > output.start_row);
+
+    const middle = output.start_row + 1;
+    var clipped = try t.terminalUnitSnapshot(alloc, middle, 1, 8);
+    defer clipped.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), clipped.units.len);
+    try testing.expectEqual(all.units[0].unit_id, clipped.units[0].unit_id);
+}
+
+test "terminal-unit reads fail closed with deterministic precedence" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 20, .rows = 4 });
+    defer t.deinit(alloc);
+
+    try testing.expectError(
+        error.InvalidWindow,
+        t.terminalUnitSnapshot(alloc, std.math.maxInt(u64), 2, 8),
+    );
+
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("still-running");
+    try t.semanticPrompt(.init(.end_input_start_output));
+
+    var open = try t.terminalUnitSnapshot(alloc, 0, 4, 8);
+    defer open.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), open.units.len);
+    const unit_id = open.units[0].unit_id;
+    try testing.expectError(
+        error.NotClosed,
+        t.terminalUnitText(alloc, open.row_space_revision, unit_id),
+    );
+    try testing.expectError(
+        error.InvalidUnit,
+        t.terminalUnitText(
+            alloc,
+            open.row_space_revision,
+            std.math.maxInt(u64),
+        ),
+    );
+
+    const stale_revision = open.row_space_revision;
+    try t.resize(alloc, .{ .cols = 10, .rows = 4 });
+    try testing.expectError(
+        error.StaleRevision,
+        t.terminalUnitText(alloc, stale_revision, std.math.maxInt(u64)),
+    );
+
+    try t.semanticPrompt(.{
+        .action = .end_command,
+        .options_unvalidated = "0",
+    });
+    var closed = try t.terminalUnitSnapshot(alloc, 0, 4, 8);
+    defer closed.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), closed.units.len);
+    const prompt = t.terminalUnitPin(unit_id).?;
+    prompt.node.page().clearTerminalUnitId(prompt.rowAndCell().row);
+    try testing.expectError(
+        error.NotRetained,
+        t.terminalUnitText(alloc, closed.row_space_revision, unit_id),
+    );
+}
+
+test "terminal-unit text becomes not retained after scrollback eviction" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{
+        .cols = 10,
+        .rows = 3,
+        .max_scrollback = 1,
+    });
+    defer t.deinit(alloc);
+
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("old");
+    try t.semanticPrompt(.init(.end_input_start_output));
+    try t.printString("\nold\n");
+    try t.semanticPrompt(.{
+        .action = .end_command,
+        .options_unvalidated = "0",
+    });
+
+    var initial = try t.terminalUnitSnapshot(alloc, 0, 3, 8);
+    defer initial.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), initial.units.len);
+    const unit_id = initial.units[0].unit_id;
+
+    for (0..100_000) |_| {
+        try t.linefeed();
+        if (t.terminalUnitPin(unit_id) == null) break;
+    }
+    try testing.expect(t.terminalUnitPin(unit_id) == null);
+
+    const revision = t.screens.active.pages.scrollbar().row_space_revision;
+    try testing.expectError(
+        error.NotRetained,
+        t.terminalUnitText(alloc, revision, unit_id),
+    );
+}
+
+test "terminal-unit queries invalidate on alternate screen and recover on primary" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 20, .rows = 4 });
+    defer t.deinit(alloc);
+
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("primary");
+    try t.semanticPrompt(.init(.end_input_start_output));
+    try t.printString("\nvalue\n");
+    try t.semanticPrompt(.{
+        .action = .end_command,
+        .options_unvalidated = "0",
+    });
+
+    var primary = try t.terminalUnitSnapshot(alloc, 0, 4, 8);
+    defer primary.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), primary.units.len);
+    const unit_id = primary.units[0].unit_id;
+
+    _ = try t.switchScreen(.alternate);
+    var alternate = try t.terminalUnitSnapshot(alloc, 0, 4, 8);
+    defer alternate.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), alternate.units.len);
+    try testing.expectError(
+        error.NotRetained,
+        t.terminalUnitText(
+            alloc,
+            t.screens.active.pages.scrollbar().row_space_revision,
+            unit_id,
+        ),
+    );
+
+    _ = try t.switchScreen(.primary);
+    var restored = try t.terminalUnitSnapshot(alloc, 0, 4, 8);
+    defer restored.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), restored.units.len);
+    const text = try t.terminalUnitText(
+        alloc,
+        restored.row_space_revision,
+        unit_id,
+    );
+    defer text.deinit(alloc);
+    try testing.expectEqualStrings("\nvalue\n", text.output.?);
+}
+
+test "terminal-unit activity ignores ordinary bytes and tracks boundaries" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 20, .rows = 4 });
+    defer t.deinit(alloc);
+
+    var activity = t.terminalUnitActivity();
+    try t.printString("ordinary bytes");
+    try testing.expectEqual(activity, t.terminalUnitActivity());
+
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("true");
+    try testing.expectEqual(activity, t.terminalUnitActivity());
+
+    try t.semanticPrompt(.init(.end_input_start_output));
+    try testing.expect(activity != t.terminalUnitActivity());
+    activity = t.terminalUnitActivity();
+
+    try t.printString("\noutput");
+    try testing.expectEqual(activity, t.terminalUnitActivity());
+    try t.semanticPrompt(.{
+        .action = .end_command,
+        .options_unvalidated = "0",
+    });
+    try testing.expect(activity != t.terminalUnitActivity());
+    activity = t.terminalUnitActivity();
+
+    try t.resize(alloc, .{ .cols = 10, .rows = 4 });
+    try testing.expect(activity != t.terminalUnitActivity());
+}
+
 /// Set the title for the terminal, as set by escape sequences (e.g. OSC 0/2).
 pub fn setTitle(self: *Terminal, t: []const u8) !void {
     if (t.len == 0) {
@@ -4475,6 +6178,11 @@ pub fn switchScreen(self: *Terminal, key: ScreenSet.Key) !?*Screen {
     if (self.screens.active_key == key) return null;
     const old = self.screens.active;
 
+    // A pending terminal-unit boundary belongs to the screen the unit
+    // completed on. Carrying it across a screen switch would reserve a row
+    // at an unrelated later prompt.
+    self.terminal_unit_boundary_pending = false;
+
     // We always end hyperlink state when switching screens.
     // We need to do this on the original screen.
     old.endHyperlink();
@@ -4523,6 +6231,8 @@ pub fn switchScreen(self: *Terminal, key: ScreenSet.Key) !?*Screen {
 
     // Clear our selection
     new.clearSelection();
+    old.pages.invalidatePromptJumpLanding();
+    new.pages.invalidatePromptJumpLanding();
 
     if (comptime build_options.kitty_graphics) {
         // Mark kitty images as dirty so they redraw. Without this set
@@ -4669,6 +6379,8 @@ pub fn fullReset(self: *Terminal) void {
 
     // Reset our screens
     self.screens.active.reset();
+    self.terminal_unit_open_id = null;
+    self.terminal_unit_boundary_pending = false;
 
     // Rest our basic state
     self.modes.reset();

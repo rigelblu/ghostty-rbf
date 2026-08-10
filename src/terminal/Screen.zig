@@ -268,6 +268,9 @@ pub const Options = struct {
     /// Shared activity epoch owned by ScreenSet.
     selection_activity_shared: ?*std.atomic.Value(u64) = null,
 
+    /// Shared terminal-unit activity epoch owned by ScreenSet.
+    terminal_unit_activity_shared: ?*std.atomic.Value(u64) = null,
+
     /// The total storage limit for Kitty images in bytes for this
     /// screen. Kitty image storage is per-screen.
     kitty_image_storage_limit: usize = switch (build_options.artifact) {
@@ -323,6 +326,7 @@ pub fn init(
         opts.max_scrollback,
     );
     errdefer pages.deinit();
+    pages.terminal_unit_activity_shared = opts.terminal_unit_activity_shared;
 
     // Create our tracked pin for the cursor.
     const page_pin = try pages.trackPin(.{ .node = pages.pages.first.? });
@@ -1734,6 +1738,8 @@ pub fn clearCells(
         assert(@intFromPtr(&cells[0]) >= @intFromPtr(&row_cells[0]));
         assert(@intFromPtr(&cells[cells.len - 1]) <= @intFromPtr(&row_cells[row_cells.len - 1]));
     }
+
+    if (cells.len == self.pages.cols) page.clearTerminalUnitId(row);
 
     // If we have managed memory (styles, graphemes, or hyperlinks)
     // in this row then we go cell by cell and clear them if present.

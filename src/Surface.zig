@@ -7266,9 +7266,19 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         },
 
         .jump_to_prompt => |delta| {
-            self.queueIo(.{
-                .jump_to_prompt = @intCast(delta),
-            }, .unlocked);
+            // Prompt navigation only mutates renderer-owned viewport state.
+            // Apply it while holding the same terminal lock used by Termio so
+            // embedded callers can immediately read the authoritative landing
+            // row after a successful binding action.
+            {
+                self.renderer_state.mutex.lock();
+                defer self.renderer_state.mutex.unlock();
+                self.renderer_state.terminal.screens.active.scroll(.{
+                    .delta_prompt = @intCast(delta),
+                });
+            }
+
+            try self.queueRender();
         },
 
         .write_screen_file => |v| try self.writeScreenFile(

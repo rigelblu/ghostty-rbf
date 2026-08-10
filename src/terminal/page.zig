@@ -125,6 +125,19 @@ const hyperlink_count_default = 4;
 const hyperlink_bytes_default = hyperlink_count_default * @sizeOf(hyperlink.Set.Item);
 const hyperlink_cell_multiplier = 16;
 
+pub const TerminalUnitData = struct {
+    unit_id: u64 = 0,
+    started_at: ?std.time.Instant = null,
+    duration_ns: ?u64 = null,
+    exit_status: i32 = 0,
+    pwd: ?Offset(u8).Slice = null,
+    lifecycle: enum(u8) {
+        open = 0,
+        closed = 1,
+        closed_unknown = 2,
+    } = .open,
+};
+
 /// A page represents a specific section of terminal screen. The primary
 /// idea of a page is that it is a fully self-contained unit that can be
 /// serialized, copied, etc. as a convenient way to represent a section
@@ -174,6 +187,11 @@ pub const Page = struct {
     /// to row, you must use the `rows` field. From the pointer to the
     /// first column, all cells in that row are laid out in column order.
     cells: Offset(Cell),
+
+    /// Page-local storage for terminal-unit identities. Rows contain a
+    /// one-based slot into this array so row rotations move the marker with
+    /// the row without exposing the full identity in the public Row bits.
+    terminal_units: Offset(TerminalUnitData),
 
     /// Set to true when an operation is performed that dirties all rows in
     /// the page. See `Row.dirty` for more information on dirty tracking.
@@ -260,6 +278,11 @@ pub const Page = struct {
 
         const rows = buf.member(Row, l.rows_start);
         const cells = buf.member(Cell, l.cells_start);
+        const terminal_units = buf.member(
+            TerminalUnitData,
+            l.terminal_units_start,
+        );
+        @memset(terminal_units.ptr(buf)[0..cap.rows], .{});
 
         // We need to go through and initialize all the rows so that
         // they point to a valid offset into the cells, since the rows
@@ -277,6 +300,7 @@ pub const Page = struct {
             .memory = @alignCast(buf.start()[0..l.total_size]),
             .rows = rows,
             .cells = cells,
+            .terminal_units = terminal_units,
             .styles = StyleSet.init(
                 buf.add(l.styles_start),
                 l.styles_layout,
@@ -343,6 +367,9 @@ pub const Page = struct {
         InvalidSpacerTailLocation,
         InvalidSpacerHeadLocation,
         UnwrappedSpacerHead,
+        InvalidTerminalUnitSlot,
+        DuplicateTerminalUnitSlot,
+        OrphanTerminalUnitData,
     };
 
     /// Temporarily pause integrity checks. This is useful when you are
@@ -418,11 +445,35 @@ pub const Page = struct {
         defer styles_seen.deinit();
         var hyperlinks_seen = std.AutoHashMap(hyperlink.Id, usize).init(alloc);
         defer hyperlinks_seen.deinit();
+        const terminal_unit_slots_seen = try alloc.alloc(bool, self.capacity.rows);
+        @memset(terminal_unit_slots_seen, false);
 
         const grapheme_count = self.graphemeCount();
 
         const rows = self.rows.ptr(self.memory)[0..self.size.rows];
         for (rows, 0..) |*row, y| {
+            if (row.terminal_unit_slot != 0) {
+                const slot_index: usize =
+                    @as(usize, row.terminal_unit_slot) - 1;
+                if (slot_index >= terminal_unit_slots_seen.len or
+                    self.terminal_units.ptr(self.memory)[slot_index].unit_id == 0)
+                {
+                    log.warn(
+                        "page integrity violation invalid terminal-unit slot y={} slot={}",
+                        .{ y, row.terminal_unit_slot },
+                    );
+                    return IntegrityError.InvalidTerminalUnitSlot;
+                }
+                if (terminal_unit_slots_seen[slot_index]) {
+                    log.warn(
+                        "page integrity violation duplicate terminal-unit slot y={} slot={}",
+                        .{ y, row.terminal_unit_slot },
+                    );
+                    return IntegrityError.DuplicateTerminalUnitSlot;
+                }
+                terminal_unit_slots_seen[slot_index] = true;
+            }
+
             const graphemes_start = graphemes_seen;
             const cells = row.cells.ptr(self.memory)[0..self.size.cols];
             for (cells, 0..) |*cell, x| {
@@ -566,6 +617,19 @@ pub const Page = struct {
                     );
                     return IntegrityError.UnmarkedGraphemeRow;
                 }
+            }
+        }
+
+        for (
+            self.terminal_units.ptr(self.memory)[0..self.capacity.rows],
+            0..,
+        ) |data, index| {
+            if (data.unit_id != 0 and !terminal_unit_slots_seen[index]) {
+                log.warn(
+                    "page integrity violation orphan terminal-unit data slot={}",
+                    .{index + 1},
+                );
+                return IntegrityError.OrphanTerminalUnitData;
             }
         }
 
@@ -728,6 +792,10 @@ pub const Page = struct {
         // First pass: count styles and grapheme bytes
         const rows = self.rows.ptr(self.memory)[y_start..y_end];
         for (rows) |*row| {
+            if (self.terminalUnitData(row)) |data| {
+                if (data.pwd) |pwd_|
+                    string_bytes += StringAlloc.bytesRequired(u8, pwd_.len);
+            }
             const cells = row.cells.ptr(self.memory)[0..self.size.cols];
             for (cells) |*cell| {
                 if (cell.style_id != stylepkg.default_id) {
@@ -860,6 +928,8 @@ pub const Page = struct {
         x_start: usize,
         x_end_req: usize,
     ) CloneFromError!void {
+        if (self == other and dst_row == src_row) return;
+
         // This whole operation breaks integrity until the end.
         self.pauseIntegrityChecks(true);
         defer {
@@ -877,6 +947,20 @@ pub const Page = struct {
         // clear some state. This will free up the managed memory as well.
         if (dst_row.managedMemory()) self.clearCells(dst_row, x_start, x_end);
 
+        const full_row_copy = (x_end - x_start) == self.size.cols;
+        const src_terminal_unit_data = if (full_row_copy)
+            other.terminalUnitData(src_row)
+        else
+            null;
+        const dst_terminal_unit_slot = if (!full_row_copy)
+            dst_row.terminal_unit_slot
+        else
+            0;
+
+        // A full-row clone replaces the destination marker. Clear it before
+        // copying metadata so its page-local slot can be reused.
+        if (full_row_copy) self.clearTerminalUnitId(dst_row);
+
         // Copy all the row metadata but keep our cells offset
         dst_row.* = copy: {
             var copy = src_row.*;
@@ -890,13 +974,21 @@ pub const Page = struct {
                 copy.hyperlink = dst_row.hyperlink;
                 copy.styled = dst_row.styled;
                 copy.dirty |= dst_row.dirty;
+                copy.terminal_unit_slot = 0;
             }
 
             // Our cell offset remains the same
             copy.cells = dst_row.cells;
+            copy.terminal_unit_slot = 0;
 
             break :copy copy;
         };
+
+        if (src_terminal_unit_data) |data| {
+            self.cloneTerminalUnitData(dst_row, other, data) catch unreachable;
+        } else if (dst_terminal_unit_slot != 0) {
+            dst_row.terminal_unit_slot = dst_terminal_unit_slot;
+        }
 
         // If we have no managed memory in the source, then we can just
         // copy it directly.
@@ -1221,6 +1313,7 @@ pub const Page = struct {
         defer self.assertIntegrity();
 
         const cells = row.cells.ptr(self.memory)[left..end];
+        if (cells.len == self.size.cols) self.clearTerminalUnitId(row);
 
         // If we have managed memory (styles, graphemes, or hyperlinks)
         // in this row then we go cell by cell and clear them if present.
@@ -1689,6 +1782,129 @@ pub const Page = struct {
         row.styled = false;
     }
 
+    /// Return the full terminal-unit identity carried by a row marker.
+    pub fn terminalUnitData(
+        self: *const Page,
+        row: *const Row,
+    ) ?*const TerminalUnitData {
+        const slot = row.terminal_unit_slot;
+        if (slot == 0) return null;
+        const index: usize = @as(usize, slot) - 1;
+        if (index >= self.capacity.rows) return null;
+        const data = &self.terminal_units.ptr(self.memory)[index];
+        return if (data.unit_id == 0) null else data;
+    }
+
+    pub fn terminalUnitDataMut(
+        self: *Page,
+        row: *Row,
+    ) ?*TerminalUnitData {
+        return @constCast(self.terminalUnitData(row));
+    }
+
+    pub fn terminalUnitId(self: *const Page, row: *const Row) ?u64 {
+        return if (self.terminalUnitData(row)) |data| data.unit_id else null;
+    }
+
+    /// Set a terminal-unit marker on a row. The full identity is page-owned;
+    /// the row stores only a one-based slot so row rotations remain correct.
+    pub fn setTerminalUnitId(
+        self: *Page,
+        row: *Row,
+        unit_id: u64,
+    ) error{OutOfSpace}!void {
+        return self.setTerminalUnitData(row, .{ .unit_id = unit_id });
+    }
+
+    pub fn setTerminalUnitData(
+        self: *Page,
+        row: *Row,
+        data: TerminalUnitData,
+    ) error{OutOfSpace}!void {
+        assert(data.unit_id != 0);
+        self.clearTerminalUnitId(row);
+
+        const units = self.terminal_units.ptr(self.memory)[0..self.capacity.rows];
+        for (units, 0..) |*candidate, index| {
+            if (candidate.unit_id != 0) continue;
+            if (index >= std.math.maxInt(u16)) return error.OutOfSpace;
+            candidate.* = data;
+            row.terminal_unit_slot = @intCast(index + 1);
+            return;
+        }
+        return error.OutOfSpace;
+    }
+
+    pub fn setTerminalUnit(
+        self: *Page,
+        row: *Row,
+        unit_id: u64,
+        pwd: ?[]const u8,
+    ) error{OutOfSpace}!void {
+        assert(unit_id != 0);
+        self.clearTerminalUnitId(row);
+
+        const pwd_page: ?Offset(u8).Slice = if (pwd) |value| pwd_: {
+            if (value.len == 0) break :pwd_ null;
+            const buf = self.string_alloc.alloc(
+                u8,
+                self.memory,
+                value.len,
+            ) catch break :pwd_ null;
+            @memcpy(buf, value);
+            break :pwd_ .{
+                .offset = getOffset(u8, self.memory, &buf[0]),
+                .len = value.len,
+            };
+        } else null;
+        errdefer if (pwd_page) |value|
+            self.string_alloc.free(self.memory, value.slice(self.memory));
+
+        self.setTerminalUnitData(row, .{
+            .unit_id = unit_id,
+            .pwd = pwd_page,
+            .started_at = std.time.Instant.now() catch null,
+        }) catch return error.OutOfSpace;
+    }
+
+    pub fn cloneTerminalUnitData(
+        self: *Page,
+        row: *Row,
+        other: *const Page,
+        source: *const TerminalUnitData,
+    ) error{OutOfSpace}!void {
+        var data = source.*;
+        data.pwd = if (source.pwd) |pwd_| pwd: {
+            const source_bytes = pwd_.slice(other.memory);
+            const buf = self.string_alloc.alloc(
+                u8,
+                self.memory,
+                source_bytes.len,
+            ) catch break :pwd null;
+            @memcpy(buf, source_bytes);
+            break :pwd .{
+                .offset = getOffset(u8, self.memory, &buf[0]),
+                .len = source_bytes.len,
+            };
+        } else null;
+        errdefer if (data.pwd) |pwd_|
+            self.string_alloc.free(self.memory, pwd_.slice(self.memory));
+        try self.setTerminalUnitData(row, data);
+    }
+
+    /// Remove a terminal-unit marker. This is idempotent.
+    pub fn clearTerminalUnitId(self: *Page, row: *Row) void {
+        const slot = row.terminal_unit_slot;
+        row.terminal_unit_slot = 0;
+        if (slot == 0) return;
+        const index: usize = @as(usize, slot) - 1;
+        if (index >= self.capacity.rows) return;
+        const data = &self.terminal_units.ptr(self.memory)[index];
+        if (data.pwd) |pwd_|
+            self.string_alloc.free(self.memory, pwd_.slice(self.memory));
+        data.* = .{};
+    }
+
     /// Returns true if this page is dirty at all.
     pub inline fn isDirty(self: *const Page) bool {
         if (self.dirty) return true;
@@ -1704,6 +1920,8 @@ pub const Page = struct {
         rows_size: usize,
         cells_start: usize,
         cells_size: usize,
+        terminal_units_start: usize,
+        terminal_units_size: usize,
         styles_start: usize,
         styles_layout: StyleSet.Layout,
         grapheme_alloc_start: usize,
@@ -1735,8 +1953,16 @@ pub const Page = struct {
         const cells_start = alignForward(usize, rows_end, @alignOf(Cell));
         const cells_end = cells_start + (cells_count * @sizeOf(Cell));
 
+        const terminal_units_start = alignForward(
+            usize,
+            cells_end,
+            @alignOf(TerminalUnitData),
+        );
+        const terminal_units_end =
+            terminal_units_start + (rows_count * @sizeOf(TerminalUnitData));
+
         const styles_layout: StyleSet.Layout = .init(cap.styles);
-        const styles_start = alignForward(usize, cells_end, StyleSet.base_align.toByteUnits());
+        const styles_start = alignForward(usize, terminal_units_end, StyleSet.base_align.toByteUnits());
         const styles_end = styles_start + styles_layout.total_size;
 
         const grapheme_alloc_layout = GraphemeAlloc.layout(cap.grapheme_bytes);
@@ -1783,6 +2009,8 @@ pub const Page = struct {
             .rows_size = rows_end - rows_start,
             .cells_start = cells_start,
             .cells_size = cells_end - cells_start,
+            .terminal_units_start = terminal_units_start,
+            .terminal_units_size = terminal_units_end - terminal_units_start,
             .styles_start = styles_start,
             .styles_layout = styles_layout,
             .grapheme_alloc_start = grapheme_alloc_start,
@@ -1862,11 +2090,13 @@ pub const Capacity = struct {
         const available_bits = self.availableBitsForGrid();
 
         // If we can't even fit the row metadata, return null
-        if (available_bits <= @bitSizeOf(Row)) return null;
+        if (available_bits <= @bitSizeOf(Row) + @bitSizeOf(TerminalUnitData)) return null;
 
         // We do the math of how many columns we can fit in the remaining
         // bits ignoring the metadata of a row.
-        const remaining_bits = available_bits - @bitSizeOf(Row);
+        const remaining_bits = available_bits -
+            @bitSizeOf(Row) -
+            @bitSizeOf(TerminalUnitData);
         const max_cols = remaining_bits / @bitSizeOf(Cell);
 
         // Clamp to CellCountInt max
@@ -1886,7 +2116,9 @@ pub const Capacity = struct {
             // The size per row is:
             //   - The row metadata itself
             //   - The cells per row (n=cols)
-            const bits_per_row: usize = @bitSizeOf(Row) + @bitSizeOf(Cell) * @as(usize, @intCast(cols));
+            const bits_per_row: usize = @bitSizeOf(Row) +
+                @bitSizeOf(TerminalUnitData) +
+                @bitSizeOf(Cell) * @as(usize, @intCast(cols));
             const new_rows: usize = @divFloor(available_bits, bits_per_row);
 
             // If our rows go to zero then we can't fit any row metadata
@@ -1995,7 +2227,18 @@ pub const Row = packed struct(u64) {
     /// screen.
     dirty: bool = false,
 
-    _padding: u23 = 0,
+    /// One-based index into Page.terminal_unit_ids. Zero means no marker.
+    terminal_unit_slot: u16 = 0,
+
+    /// This blank row is reserved as breathing room between terminal units.
+    ///
+    /// The marker belongs to the row rather than a unit snapshot so row
+    /// movement keeps it attached to the cells it describes. Any visible
+    /// write, erase, or structural replacement clears it before consumers
+    /// can continue treating the row as safe overlay space.
+    terminal_unit_boundary: bool = false,
+
+    _padding: u6 = 0,
 
     /// The semantic prompt state of the row. See `semantic_prompt`.
     pub const SemanticPrompt = enum(u2) {
@@ -2229,6 +2472,30 @@ pub const Cell = packed struct(u64) {
     pub inline fn hasTextAny(cells: []const Cell) bool {
         for (cells) |cell| {
             if (cell.hasText()) return true;
+        }
+
+        return false;
+    }
+
+    /// Returns true if this cell paints a visible glyph.
+    ///
+    /// This is deliberately more permissive than `hasText`: a space is
+    /// text but paints nothing, and shells write spaces into the row
+    /// preceding a prompt (zsh's `prompt_sp`, for example) as part of
+    /// ordinary prompt rendering. Treating those rows as occupied would
+    /// make every command whose output lacks a trailing newline look
+    /// like it has content where it visually does not.
+    ///
+    /// Background-only cells return false for the same reason `hasText`
+    /// does: they paint a color band, not a glyph.
+    pub inline fn rendersGlyph(self: Cell) bool {
+        return self.hasText() and self.codepoint() != ' ';
+    }
+
+    /// Returns true if any cell in the set paints a visible glyph.
+    pub inline fn rendersGlyphAny(cells: []const Cell) bool {
+        for (cells) |cell| {
+            if (cell.rendersGlyph()) return true;
         }
 
         return false;
@@ -3212,6 +3479,51 @@ test "Page cloneRowFrom partial" {
             try testing.expectEqual(expected, rac.cell.content.codepoint.data);
         }
     }
+}
+
+test "terminal-unit page metadata zeroes on reuse and clone slots do not alias" {
+    const cap: Capacity = .{
+        .cols = 4,
+        .rows = 4,
+        .string_bytes = 256,
+    };
+    var page = try Page.init(cap);
+    defer page.deinit();
+    const rows = page.rows.ptr(page.memory);
+
+    try page.setTerminalUnit(&rows[0], 11, "/work/source");
+    try page.setTerminalUnit(&rows[1], 22, "/work/destination");
+
+    // A partial row clone preserves the destination row's marker rather than
+    // copying or aliasing the source marker slot.
+    try page.clonePartialRowFrom(
+        &page,
+        &rows[1],
+        &rows[0],
+        1,
+        2,
+    );
+    try testing.expectEqual(@as(?u64, 11), page.terminalUnitId(&rows[0]));
+    try testing.expectEqual(@as(?u64, 22), page.terminalUnitId(&rows[1]));
+
+    // A full clone owns an independent destination slot and PWD allocation.
+    try page.cloneRowFrom(&page, &rows[1], &rows[0]);
+    try testing.expectEqual(@as(?u64, 11), page.terminalUnitId(&rows[1]));
+    const dst_data = page.terminalUnitData(&rows[1]).?;
+    try testing.expectEqualStrings(
+        "/work/source",
+        dst_data.pwd.?.slice(page.memory),
+    );
+    page.clearTerminalUnitId(&rows[0]);
+    try testing.expectEqual(@as(?u64, null), page.terminalUnitId(&rows[0]));
+    try testing.expectEqual(@as(?u64, 11), page.terminalUnitId(&rows[1]));
+
+    // Reinitializing a pooled-style backing buffer explicitly zeroes both
+    // row slots and their page-owned metadata array.
+    page.reinit();
+    const reused_rows = page.rows.ptr(page.memory);
+    for (reused_rows[0..page.size.rows]) |*row|
+        try testing.expectEqual(@as(?u64, null), page.terminalUnitId(row));
 }
 
 test "Page cloneRowFrom partial grapheme in non-copied source region" {

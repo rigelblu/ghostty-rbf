@@ -683,10 +683,23 @@ const Subprocess = struct {
                 log.warn("failed to get ghostty exe path err={}", .{err});
                 break :ghostty_path;
             }];
-            const ghostty_bin = resolveGhosttyBin(&env, exe_bin_path) orelse {
+            const ghostty_bin_resolved = resolveGhosttyBin(&env, exe_bin_path) orelse {
                 log.warn("failed to resolve ghostty CLI path; CLI shell integration disabled", .{});
                 break :ghostty_path;
             };
+
+            // resolveGhosttyBin may return the map's own stored GHOSTTY_BIN
+            // value. env.put on an existing key copies the new value and then
+            // frees the old buffer, so after the GHOSTTY_BIN put below, any
+            // other slice of that buffer — bin_dir, and the PATH append —
+            // reads freed memory and exports garbage bytes into the child's
+            // environment. Copy to a local buffer so no put can free what we
+            // still reference.
+            var ghostty_bin_buf: [std.fs.max_path_bytes]u8 = undefined;
+            if (ghostty_bin_resolved.len > ghostty_bin_buf.len) break :ghostty_path;
+            const ghostty_bin = ghostty_bin_buf[0..ghostty_bin_resolved.len];
+            @memcpy(ghostty_bin, ghostty_bin_resolved);
+
             const bin_dir = std.fs.path.dirname(ghostty_bin) orelse break :ghostty_path;
             log.debug("resolved ghostty CLI path={s}", .{ghostty_bin});
 

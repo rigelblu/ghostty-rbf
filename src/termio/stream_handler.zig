@@ -1386,6 +1386,12 @@ pub const StreamHandler = struct {
         };
         if (!host_valid) {
             log.warn("OSC 7 host ({s}) must be local", .{host.bytes});
+
+            // Our stored pwd is now stale relative to the shell driving this
+            // terminal. Record that so consumers which attribute a directory
+            // to specific work (terminal units) can decline rather than
+            // report the last local path.
+            self.terminal.flags.pwd_remote = true;
             return;
         }
 
@@ -1397,6 +1403,7 @@ pub const StreamHandler = struct {
         const path = try uri.path.toRawMaybeAlloc(stack_alloc.get());
 
         log.debug("terminal pwd: {s}", .{path});
+        self.terminal.flags.pwd_remote = false;
         try self.terminal.setPwd(path);
 
         // Report it to the surface. If creating our write request fails

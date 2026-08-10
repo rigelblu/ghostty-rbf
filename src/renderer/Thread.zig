@@ -785,6 +785,9 @@ compression: Compression = undefined,
 /// callbacks can run after the terminal mutex is released.
 selection_activity: terminalpkg.Terminal.SelectionActivity = 0,
 
+/// Last terminal-unit activity delivered to the apprt.
+terminal_unit_activity: u64 = 0,
+
 /// The surface we're rendering to.
 surface: *apprt.Surface,
 
@@ -979,6 +982,7 @@ pub fn renderNow(self: *Thread) void {
     };
 
     self.notifySelectionChanged();
+    self.notifyTerminalUnitsChanged();
 
     self.updateFrame(self.effectiveCursorBlinkVisible()) catch |err| {
         log.warn("renderNow: error updating frame err={}", .{err});
@@ -1002,6 +1006,7 @@ pub fn renderNowWithPresentation(
     };
 
     self.notifySelectionChanged();
+    self.notifyTerminalUnitsChanged();
 
     self.updateFrame(self.effectiveCursorBlinkVisible()) catch |err| {
         log.warn("renderNowWithPresentation: error updating frame err={}", .{err});
@@ -2045,6 +2050,7 @@ fn renderCallback(
     // Selection activity is a lock-free terminal-wide epoch, so hidden
     // surfaces can keep accessibility state current without rebuilding.
     t.notifySelectionChanged();
+    t.notifyTerminalUnitsChanged();
 
     // Preserve terminal dirty state while hidden. The visibility regain path
     // consumes the accumulated row union in one update before presenting.
@@ -3031,6 +3037,20 @@ fn notifySelectionChanged(self: *Thread) void {
         {},
     ) catch |err| {
         log.warn("apprt failed selection_changed notification err={}", .{err});
+    };
+}
+
+fn notifyTerminalUnitsChanged(self: *Thread) void {
+    const activity = self.state.terminal.terminalUnitActivity();
+    if (self.terminal_unit_activity == activity) return;
+    self.terminal_unit_activity = activity;
+
+    _ = self.surface.rtApp().performAction(
+        .{ .surface = self.surface.core() },
+        .terminal_units_changed,
+        {},
+    ) catch |err| {
+        log.warn("apprt failed terminal_units_changed notification err={}", .{err});
     };
 }
 

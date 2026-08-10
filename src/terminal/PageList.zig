@@ -419,6 +419,15 @@ total_rows: usize,
 /// whenever retained rows can move to different absolute offsets.
 row_space_revision: u64 = 0,
 
+/// Absolute prompt row selected by the most recent prompt jump. This remains
+/// valid even when that prompt lies in the active viewport, where `viewport`
+/// intentionally stays `.active`. Non-prompt viewport movement invalidates it.
+last_prompt_jump_row: ?u64 = null,
+
+/// Lock-free terminal-unit activity epoch owned by ScreenSet. Row-space
+/// invalidations advance it so embedders can refresh bounded snapshots.
+terminal_unit_activity_shared: ?*std.atomic.Value(u64) = null,
+
 /// The list of tracked pins. These are kept up to date automatically.
 tracked_pins: PinSet,
 
@@ -923,7 +932,7 @@ pub fn deinit(self: *PageList) void {
 /// memory to fit the active area.
 pub fn reset(self: *PageList) void {
     defer self.assertIntegrity();
-    self.row_space_revision +%= 1;
+    self.advanceRowSpaceRevision();
 
     // Reset discards all scrollback, so there is nothing left to compress.
     self.page_compression.reset();
@@ -1050,6 +1059,7 @@ pub fn reset(self: *PageList) void {
 
     // Move our viewport back to the active area since everything is gone.
     self.viewport = .active;
+    self.last_prompt_jump_row = null;
 }
 
 pub const Clone = struct {
@@ -1250,7 +1260,7 @@ pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
     defer self.assertIntegrity();
 
     if (opts.cols) |cols| {
-        if (cols != self.cols) self.row_space_revision +%= 1;
+        if (cols != self.cols) self.advanceRowSpaceRevision();
     }
 
     // Resizing forces all nodes to be decompressed today so we need to
@@ -1568,6 +1578,8 @@ const ReflowCursor = struct {
         const src_row = row.rowAndCell().row;
         const src_y = row.y;
         const cells = src_row.cells.ptr(src_page.memory)[0..src_page.size.cols];
+        const terminal_unit_data = src_page.terminalUnitData(src_row);
+        var terminal_unit_marker_pending = terminal_unit_data != null;
 
         // Calculate the columns in this row. First up we trim non-semantic
         // rightmost blanks.
@@ -1655,6 +1667,23 @@ const ReflowCursor = struct {
                 try self.cursorScrollOrNewPage(list, cap);
                 self.copyRowMetadata(src_row);
                 self.page_row.wrap_continuation = true;
+            }
+
+            // A unit marker identifies the primary prompt row. Copy it onto
+            // only the first destination row that receives source cells;
+            // soft-wrap continuation rows deliberately receive no duplicate.
+            if (terminal_unit_marker_pending) {
+                if (terminal_unit_data) |data| {
+                    // Marker metadata is page-owned. A destination slot
+                    // failure indicates inconsistent page metadata; dropping
+                    // the marker is the intentional fail-closed behavior.
+                    self.page.cloneTerminalUnitData(
+                        self.page_row,
+                        src_page,
+                        data,
+                    ) catch {};
+                }
+                terminal_unit_marker_pending = false;
             }
 
             // Move any tracked pins from the source.
@@ -2434,7 +2463,7 @@ fn resizeWithoutReflow(self: *PageList, opts: Resize) Allocator.Error!void {
                 const trimmed = self.trimTrailingBlankRows(self.rows - rows);
 
                 // Account for our trimmed rows in the total row cache
-                if (trimmed > 0) self.row_space_revision +%= 1;
+                if (trimmed > 0) self.advanceRowSpaceRevision();
                 self.total_rows -= trimmed;
 
                 // If we didn't trim enough, just modify our row count and this
@@ -2839,6 +2868,11 @@ pub const Scroll = union(enum) {
 pub fn scroll(self: *PageList, behavior: Scroll) void {
     defer self.assertIntegrity();
 
+    switch (behavior) {
+        .delta_prompt => {},
+        else => self.last_prompt_jump_row = null,
+    }
+
     // Special case no-scrollback mode to never allow scrolling.
     if (self.explicit_max_size == 0) {
         self.viewport = .active;
@@ -3052,6 +3086,8 @@ pub fn scroll(self: *PageList, behavior: Scroll) void {
 /// Jump the viewport forwards (positive) or backwards (negative) a set number of
 /// prompts (delta).
 fn scrollPrompt(self: *PageList, delta: isize) void {
+    self.last_prompt_jump_row = null;
+
     // If we aren't jumping any prompts then we don't need to do anything.
     if (delta == 0) return;
     const delta_start: usize = @abs(delta);
@@ -3095,6 +3131,8 @@ fn scrollPrompt(self: *PageList, delta: isize) void {
     // area we keep our viewport as active because we can't scroll DOWN
     // into the active area. Otherwise, we scroll up to the pin.
     if (prompt_pin) |p| {
+        const landing = self.pointFromPin(.screen, p) orelse return;
+        self.last_prompt_jump_row = landing.screen.y;
         if (self.pinIsActive(p)) {
             self.viewport = .active;
         } else {
@@ -3403,6 +3441,23 @@ pub const Scrollbar = struct {
     }
 };
 
+fn advanceRowSpaceRevision(self: *PageList) void {
+    self.row_space_revision +%= 1;
+    self.last_prompt_jump_row = null;
+    if (self.terminal_unit_activity_shared) |activity|
+        _ = activity.fetchAdd(1, .release);
+}
+
+/// Return the exact absolute prompt row selected by the latest prompt jump.
+/// A non-prompt viewport movement or row-space invalidation clears this.
+pub fn promptJumpLandingRow(self: *const PageList) ?u64 {
+    return self.last_prompt_jump_row;
+}
+
+pub fn invalidatePromptJumpLanding(self: *PageList) void {
+    self.last_prompt_jump_row = null;
+}
+
 /// Return the scrollbar state for this PageList.
 ///
 /// This is amortized O(1): the total is maintained incrementally and
@@ -3535,6 +3590,8 @@ pub fn maxSize(self: *const PageList) usize {
 pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
     defer self.assertIntegrity();
 
+    if (self.viewport == .active) self.last_prompt_jump_row = null;
+
     // Growing can move a complete page behind the active boundary.
     self.page_compression.markActivity();
 
@@ -3585,7 +3642,7 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
             break :prune;
         }
 
-        self.row_space_revision +%= 1;
+        self.advanceRowSpaceRevision();
 
         // If we have a pin viewport cache then we need to update it.
         if (self.viewport == .pin) viewport: {
@@ -4890,7 +4947,7 @@ fn eraseRows(
     }
 
     // Update our total row count
-    if (erased > 0) self.row_space_revision +%= 1;
+    if (erased > 0) self.advanceRowSpaceRevision();
     self.total_rows -= erased;
 
     // If we deleted active, we need to regrow because one of our invariants
@@ -9407,6 +9464,7 @@ test "PageList: jump zero prompts" {
 
     s.scroll(.{ .delta_prompt = 0 });
     try testing.expect(s.viewport == .active);
+    try testing.expectEqual(@as(?u64, null), s.promptJumpLandingRow());
 
     try testing.expectEqual(Scrollbar{
         .total = s.total_rows,
@@ -9447,6 +9505,7 @@ test "Screen: jump back one prompt" {
     {
         s.scroll(.{ .delta_prompt = -1 });
         try testing.expect(s.viewport == .pin);
+        try testing.expectEqual(@as(?u64, 1), s.promptJumpLandingRow());
         try testing.expectEqual(point.Point{ .screen = .{
             .x = 0,
             .y = 1,
@@ -9477,6 +9536,7 @@ test "Screen: jump back one prompt" {
     {
         s.scroll(.{ .delta_prompt = 1 });
         try testing.expect(s.viewport == .active);
+        try testing.expectEqual(@as(?u64, 5), s.promptJumpLandingRow());
         try testing.expectEqual(Scrollbar{
             .total = s.total_rows,
             .offset = s.total_rows - s.rows,
@@ -9486,12 +9546,16 @@ test "Screen: jump back one prompt" {
     {
         s.scroll(.{ .delta_prompt = 1 });
         try testing.expect(s.viewport == .active);
+        try testing.expectEqual(@as(?u64, 5), s.promptJumpLandingRow());
         try testing.expectEqual(Scrollbar{
             .total = s.total_rows,
             .offset = s.total_rows - s.rows,
             .len = s.rows,
         }, s.scrollbar());
     }
+
+    s.scroll(.{ .top = {} });
+    try testing.expectEqual(@as(?u64, null), s.promptJumpLandingRow());
 }
 
 test "Screen: jump forward prompt skips multiline continuation" {
@@ -9826,11 +9890,12 @@ test "PageList eraseRow invalidates viewport offset cache" {
     const pin_y = page.capacity.rows;
     s.scroll(.{ .pin = s.pin(.{ .screen = .{ .y = pin_y } }).? });
     try testing.expect(s.viewport == .pin);
+    const scrollbar_before = s.scrollbar();
     try testing.expectEqual(Scrollbar{
         .total = s.total_rows,
         .offset = pin_y,
         .len = s.rows,
-    }, s.scrollbar());
+    }, scrollbar_before);
 
     // Erase a single row from the history BEFORE the viewport pin.
     // This removes one row from before our pin, which changes its absolute

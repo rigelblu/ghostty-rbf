@@ -695,6 +695,86 @@ typedef struct {
   uint8_t color_blue;
 } ghostty_keyboard_copy_cursor_s;
 
+typedef enum {
+  GHOSTTY_TERMINAL_UNIT_RESULT_OK = 0,
+  GHOSTTY_TERMINAL_UNIT_RESULT_STALE_REVISION = 1,
+  GHOSTTY_TERMINAL_UNIT_RESULT_INVALID_UNIT = 2,
+  GHOSTTY_TERMINAL_UNIT_RESULT_NOT_CLOSED = 3,
+  GHOSTTY_TERMINAL_UNIT_RESULT_NOT_RETAINED = 4,
+  GHOSTTY_TERMINAL_UNIT_RESULT_OUT_OF_MEMORY = 5,
+  GHOSTTY_TERMINAL_UNIT_RESULT_INVALID_WINDOW = 6,
+} ghostty_terminal_unit_result_e;
+
+typedef enum {
+  GHOSTTY_TERMINAL_UNIT_LIFECYCLE_OPEN = 0,
+  GHOSTTY_TERMINAL_UNIT_LIFECYCLE_CLOSED = 1,
+  GHOSTTY_TERMINAL_UNIT_LIFECYCLE_CLOSED_UNKNOWN = 2,
+} ghostty_terminal_unit_lifecycle_e;
+
+// Inclusive exact cell endpoints in Ghostty's absolute screen row space.
+// `present == false` represents an empty scope.
+typedef struct {
+  size_t struct_size;
+  uint64_t start_row;
+  uint64_t end_row;
+  uint32_t start_column;
+  uint32_t end_column;
+  bool present;
+  uint8_t reserved[7];
+} ghostty_terminal_unit_range_s;
+
+typedef struct {
+  size_t struct_size;
+  uint64_t unit_id;
+  ghostty_terminal_unit_range_s prompt;
+  ghostty_terminal_unit_range_s command;
+  ghostty_terminal_unit_range_s output;
+  ghostty_terminal_unit_lifecycle_e lifecycle;
+  int32_t exit_status;
+  bool has_duration;
+  uint8_t reserved0[7];
+  uint64_t duration_ns;
+  const char* command_start_pwd;
+  size_t command_start_pwd_len;
+  // Blank grid rows available immediately before this unit's prompt and
+  // immediately after its last output row. These are derived from the live
+  // grid for every snapshot rather than stored, so they always describe the
+  // rows as they exist now: a row that has since been overwritten, reflowed,
+  // erased, or evicted reports zero rather than promising empty space that a
+  // caller would then paint chrome into. `trailing_boundary_rows` is always
+  // zero for an open unit.
+  uint8_t leading_boundary_rows;
+  uint8_t trailing_boundary_rows;
+  uint8_t reserved1[6];
+  uint64_t reserved[3];
+} ghostty_terminal_unit_s;
+
+// Callers must initialize `struct_size` before snapshot/read/free calls.
+// Ghostty reads and writes only complete fields contained by that size, so
+// older prefixes remain ABI-safe. Use the same size for the matching free.
+typedef struct {
+  size_t struct_size;
+  uint64_t row_space_revision;
+  const ghostty_terminal_unit_s* units;
+  size_t unit_count;
+  bool truncated;
+  uint8_t reserved0[7];
+  void* allocation;
+  size_t allocation_len;
+  uint64_t reserved[4];
+} ghostty_terminal_unit_snapshot_s;
+
+typedef struct {
+  size_t struct_size;
+  const char* command;
+  size_t command_len;
+  const char* output;
+  size_t output_len;
+  void* allocation;
+  size_t allocation_len;
+  uint64_t reserved[4];
+} ghostty_terminal_unit_text_s;
+
 // Config types
 
 // config.Path
@@ -1168,6 +1248,7 @@ typedef enum {
   GHOSTTY_ACTION_READONLY,
   GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD,
   GHOSTTY_ACTION_SELECTION_CHANGED,
+  GHOSTTY_ACTION_TERMINAL_UNITS_CHANGED,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -1435,6 +1516,30 @@ GHOSTTY_API bool ghostty_surface_release_external_frame(ghostty_surface_t,
                                                         uint64_t frame_token);
 GHOSTTY_API bool ghostty_surface_scrollbar(ghostty_surface_t,
                                           ghostty_surface_scrollbar_s*);
+// Returns the exact absolute prompt row selected by the most recent prompt
+// jump. Returns false after any non-prompt viewport movement or invalidation.
+GHOSTTY_API bool ghostty_surface_prompt_jump_landing(
+    ghostty_surface_t,
+    uint64_t* absolute_row);
+GHOSTTY_API ghostty_terminal_unit_result_e
+ghostty_surface_terminal_units_snapshot(
+    ghostty_surface_t,
+    uint64_t first_absolute_row,
+    uint64_t row_count,
+    size_t maximum_units,
+    ghostty_terminal_unit_snapshot_s*);
+GHOSTTY_API void ghostty_surface_free_terminal_units_snapshot(
+    ghostty_surface_t,
+    ghostty_terminal_unit_snapshot_s*);
+GHOSTTY_API ghostty_terminal_unit_result_e
+ghostty_surface_read_terminal_unit_text(
+    ghostty_surface_t,
+    uint64_t row_space_revision,
+    uint64_t unit_id,
+    ghostty_terminal_unit_text_s*);
+GHOSTTY_API void ghostty_surface_free_terminal_unit_text(
+    ghostty_surface_t,
+    ghostty_terminal_unit_text_s*);
 // Atomically validates the row-space identity and scrolls to an absolute row.
 // Returns false without scrolling when the identity no longer matches.
 GHOSTTY_API bool ghostty_surface_scroll_to_row_if_revision(
