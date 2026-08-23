@@ -5758,6 +5758,37 @@ pub const CAPI = struct {
             return copy;
         }
 
+        /// Return the exact terminal link at an explicit surface point without
+        /// changing pointer, modifier, hover, input, or selection state.
+        export fn ghostty_surface_link_at_point(
+            ptr: *Surface,
+            x: f64,
+            y: f64,
+            result: *Text,
+        ) bool {
+            const surface = &ptr.core_surface;
+            surface.renderer_state.mutex.lockUncancelable(global.io());
+            defer surface.renderer_state.mutex.unlock(global.io());
+
+            const value = surface.contextLinkAtPos(
+                global.alloc(),
+                .{ .x = @floatCast(x), .y = @floatCast(y) },
+            ) catch |err| {
+                log.warn("error resolving context link err={}", .{err});
+                return false;
+            } orelse return false;
+
+            result.* = .{
+                .tl_px_x = -1,
+                .tl_px_y = -1,
+                .offset_start = 0,
+                .offset_len = 0,
+                .text = value.ptr,
+                .text_len = value.len,
+            };
+            return true;
+        }
+
         /// This returns the selected word for quicklook. This will populate
         /// the buffer with the word under the cursor and the selection
         /// info so that quicklook can be rendered.

@@ -6274,6 +6274,29 @@ fn linkAtPos(
     );
 }
 
+/// Resolve the exact link at a surface position for a contextual host action.
+///
+/// OSC 8 metadata wins over visible-text matchers. Matcher modifier
+/// requirements are deliberately ignored because the context-menu gesture is
+/// itself explicit. The returned sentinel-terminated value is owned by
+/// `alloc`; callers must free it with the same allocator.
+pub fn contextLinkAtPos(
+    self: *Surface,
+    alloc: Allocator,
+    pos: apprt.CursorPos,
+) !?[:0]u8 {
+    const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
+    const point = self.posToViewport(pos.x, pos.y);
+    const pin = screen.pages.pin(.{ .viewport = point }) orelse return null;
+    const link = try contextLinkAtScreenPin(
+        alloc,
+        screen,
+        self.config.links,
+        pin,
+    ) orelse return null;
+    return link.value;
+}
+
 /// Detects if a link is present at the given pin.
 ///
 /// If mouse mods is null then mouse mod requirements are ignored (all
@@ -6312,6 +6335,22 @@ fn linkAtScreenPinWithOsc8(
         };
     }
     return try linkAtScreenPin(alloc, screen, links, mouse_pin, mouse_mods);
+}
+
+/// Resolve an explicit context-menu target: OSC 8 first, then every configured
+/// matcher without its ordinary activation-modifier requirement.
+fn contextLinkAtScreenPin(
+    alloc: Allocator,
+    screen: *terminal.Screen,
+    links: []const DerivedConfig.Link,
+    mouse_pin: terminal.Pin,
+) !?Link {
+    if (osc8URI(mouse_pin)) |uri| return .{
+        .action = ._open_osc8,
+        .selection = .init(mouse_pin, mouse_pin, false),
+        .value = try alloc.dupeZ(u8, uri),
+    };
+    return try linkAtScreenPin(alloc, screen, links, mouse_pin, null);
 }
 
 /// Detects a configured link at a terminal pin without requiring a full
@@ -9801,6 +9840,58 @@ test "Surface: OSC 8 owns an overlapping regex link target" {
     defer link.deinit(alloc);
     try testing.expectEqual(input.Link.Action._open_osc8, std.meta.activeTag(link.action));
     try testing.expectEqualStrings("https://target.example/osc8", link.value);
+}
+
+test "Surface: context link query prefers OSC 8 and ignores matcher modifiers" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    try oni.testing.ensureInit();
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 64, .rows = 3 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice(
+        "\x1b]8;;https://target.example/osc8\x1b\\" ++
+            "https://visible.example" ++
+            "\x1b]8;;\x1b\\.\r\n" ++
+            "https://plain.example/path",
+    );
+
+    const osc8_pin = t.screens.active.pages.pin(.{ .active = .{ .x = 10, .y = 0 } }).?;
+    var osc8 = (try contextLinkAtScreenPin(
+        alloc,
+        t.screens.active,
+        derived.links,
+        osc8_pin,
+    )) orelse return error.TestExpectedEqual;
+    defer osc8.deinit(alloc);
+    try testing.expectEqual(input.Link.Action._open_osc8, std.meta.activeTag(osc8.action));
+    try testing.expectEqualStrings("https://target.example/osc8", osc8.value);
+
+    const plain_pin = t.screens.active.pages.pin(.{ .active = .{ .x = 10, .y = 1 } }).?;
+    var plain = (try contextLinkAtScreenPin(
+        alloc,
+        t.screens.active,
+        derived.links,
+        plain_pin,
+    )) orelse return error.TestExpectedEqual;
+    defer plain.deinit(alloc);
+    try testing.expectEqualStrings("https://plain.example/path", plain.value);
+
+    const empty_pin = t.screens.active.pages.pin(.{ .active = .{ .x = 40, .y = 2 } }).?;
+    try testing.expect((try contextLinkAtScreenPin(
+        alloc,
+        t.screens.active,
+        derived.links,
+        empty_pin,
+    )) == null);
 }
 
 test "Surface: higher-priority semantic match blocks a cross-scope click" {

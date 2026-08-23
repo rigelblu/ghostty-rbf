@@ -1843,6 +1843,14 @@ GHOSTTY_API bool ghostty_surface_set_renderer_realized(ghostty_surface_t, bool);
 // surface, PTY, terminal state, or scrollback.
 GHOSTTY_API bool ghostty_surface_rebuild_renderer(ghostty_surface_t);
 GHOSTTY_API void* ghostty_surface_quicklook_font(ghostty_surface_t);
+// cmux fork: return the exact OSC 8 or configured link target at a surface
+// point without requiring activation modifiers or mutating pointer/selection
+// state. The returned text is owned by the surface and must be released with
+// ghostty_surface_free_text.
+GHOSTTY_API bool ghostty_surface_link_at_point(ghostty_surface_t,
+                                               double,
+                                               double,
+                                               ghostty_text_s*);
 GHOSTTY_API bool ghostty_surface_quicklook_word(ghostty_surface_t, ghostty_text_s*);
 #endif
 
