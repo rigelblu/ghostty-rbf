@@ -16,7 +16,7 @@
     "stress:teardown": "node scripts/stress-cycles.mjs --cycles=1 --iterations=0 --resizes=0 --renderer-deaths=0 --immediate-destroys=1000 --timeout-ms=240000"
   },
   "devDependencies": {
-    "electron": "43.1.0",
+    "electron": "43.5.0",
     "node-gyp": "13.0.1"
   }
 }
