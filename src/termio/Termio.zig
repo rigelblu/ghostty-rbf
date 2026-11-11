@@ -610,6 +610,14 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
     // Set the image limits
     try self.terminal.setKittyGraphicsSizeLimit(self.alloc, config.image_storage_limit);
     self.terminal.setKittyGraphicsLoadingLimits(.allWithTempDir(global.tmpDirPath()));
+
+    // The config could have changed any of our colors so update mode 2031.
+    // This is written directly rather than queued as a color_scheme_report
+    // message because we're on the io thread, the only reader of our
+    // mailbox: if the mailbox were full, queueing would wait forever.
+    self.colorSchemeReportLocked(td, false) catch |err| {
+        log.warn("error sending color scheme report err={}", .{err});
+    };
 }
 
 /// Update only the terminal color defaults used by OSC resets.
@@ -1044,4 +1052,79 @@ pub const ThreadData = struct {
 /// not available on a particular platform.
 pub fn getProcessInfo(self: *Termio, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
     return self.backend.getProcessInfo(info);
+}
+
+// cm-120.2: changeConfig writes the mode 2031 report itself instead of
+// queueing it into the termio mailbox, which only the IO thread drains. A
+// program that turned on mode 2031 must still get exactly one report, with
+// the new theme, and nothing may be left in the mailbox.
+test "changeConfig writes one mode 2031 report with the new theme and queues none" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var full_config = try configpkg.Config.default(alloc);
+    defer full_config.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    const write = struct {
+        fn write(ud: ?*anyopaque, ptr: [*]const u8, len: usize) callconv(.c) void {
+            const list: *std.ArrayList(u8) = @ptrCast(@alignCast(ud.?));
+            list.appendSlice(testing.allocator, ptr[0..len]) catch {};
+        }
+    }.write;
+    const manual = try termio.Manual.init(alloc, .{ .write_cb = write, .write_userdata = &out });
+
+    var mutex: std.Io.Mutex = .init;
+    var renderer_state: renderer.State = .{ .mutex = &mutex, .terminal = undefined };
+
+    // The terminal starts dark, so a report built from the old config would
+    // say dark (;1n) and fail the light (;2n) check below.
+    var initial = try DerivedConfig.init(alloc, &full_config);
+    initial.conditional_state.theme = .dark;
+
+    var t: Termio = undefined;
+    try t.init(alloc, .{
+        .size = .{
+            .screen = .{ .width = 100, .height = 100 },
+            .cell = .{ .width = 10, .height = 20 },
+            .padding = .{},
+        },
+        .full_config = &full_config,
+        .config = initial,
+        .backend = .{ .manual = manual },
+        .mailbox = try termio.Mailbox.initSPSC(alloc),
+        .renderer_state = &renderer_state,
+        .renderer_wakeup = undefined,
+        .renderer_mailbox = undefined,
+        .surface_mailbox = undefined,
+    });
+    defer t.deinit();
+    renderer_state.terminal = &t.terminal;
+
+    var td: ThreadData = .{
+        .alloc = alloc,
+        .loop = undefined,
+        .renderer_state = &renderer_state,
+        .surface_mailbox = undefined,
+        .backend = .{ .manual = .{} },
+        .mailbox = &t.mailbox,
+    };
+
+    // A program turns on mode 2031, then the theme changes from dark to light.
+    t.terminal.modes.set(.report_color_scheme, true);
+    var light = try DerivedConfig.init(alloc, &full_config);
+    light.conditional_state.theme = .light;
+    try t.changeConfig(&td, &light); // t owns light's arena from here
+    try testing.expectEqualStrings("\x1B[?997;2n", out.items);
+    try testing.expectEqual(0, t.mailbox.spsc.queue.count(testing.io));
+
+    // With mode 2031 off, a config change writes nothing.
+    out.clearRetainingCapacity();
+    t.terminal.modes.set(.report_color_scheme, false);
+    var dark = try DerivedConfig.init(alloc, &full_config);
+    dark.conditional_state.theme = .dark;
+    try t.changeConfig(&td, &dark);
+    try testing.expectEqualStrings("", out.items);
+    try testing.expectEqual(0, t.mailbox.spsc.queue.count(testing.io));
 }

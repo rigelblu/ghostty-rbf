@@ -214,8 +214,10 @@ pub const StreamHandler = struct {
         self.terminal.setDefaultCursorStyle(config.cursor_style);
         self.terminal.setDefaultCursorBlink(config.cursor_blink);
 
-        // The config could have changed any of our colors so update mode 2031
-        self.messageWriter(.{ .color_scheme_report = .{ .force = false } });
+        // The config could have changed any of our colors, but the mode
+        // 2031 report is sent by Termio.changeConfig. This runs on the io
+        // thread, which is the only reader of the termio mailbox, so
+        // sending to it here would deadlock if the mailbox were full.
     }
 
     inline fn surfaceMessageWriter(
@@ -1867,4 +1869,85 @@ test "pwd change keeps scrollbar from OSC stream position" {
     try std.testing.expectEqual(@as(usize, 0), marker_scrollbar.offset);
     try std.testing.expectEqual(.primary, marker.pwd_change.screen_key);
     try std.testing.expectEqual(@as(usize, 0), marker.pwd_change.screen_generation);
+}
+
+// cm-120.2: the IO thread drains its own termio mailbox, and it calls
+// changeConfig while handling `.change_config` (termio/Thread.zig). A
+// blocking send from changeConfig into that same mailbox waits forever when
+// the mailbox is full, because nothing else drains it. Seen in a real freeze
+// (2026-11-05): the IO thread waiting here, and main waiting on it.
+// Whether anything is queued can't be seen on a full mailbox: the slot freed
+// below lets a blocked push land, so the count is 64 either way. The Termio
+// test "changeConfig writes one mode 2031 report ..." checks that on an empty
+// mailbox.
+test "changeConfig returns on a full termio mailbox" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var term = try terminal.Terminal.init(io, alloc, .{ .cols = 5, .rows = 2 });
+    defer term.deinit(alloc);
+
+    var mutex: std.Io.Mutex = .init;
+    var renderer_state: renderer.State = .{ .mutex = &mutex, .terminal = &term };
+
+    var mailbox = try termio.Mailbox.initSPSC(alloc);
+    defer mailbox.deinit(alloc);
+    const queue = mailbox.spsc.queue;
+    for (0..64) |_| {
+        try testing.expect(queue.push(io, .{ .inspector = true }, .{ .instant = {} }) > 0);
+    }
+
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try termio.Termio.DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    var handler: StreamHandler = .{
+        .alloc = alloc,
+        .size = undefined,
+        .terminal = &term,
+        .termio_mailbox = &mailbox,
+        .surface_mailbox = undefined,
+        .renderer_state = &renderer_state,
+        .renderer_mailbox = undefined,
+        .renderer_wakeup = undefined,
+        .enquiry_response = "",
+        .osc_color_report_format = .@"16-bit",
+        .clipboard_write = .deny,
+    };
+
+    // Run it the way the IO thread does: holding the renderer lock.
+    var done: std.atomic.Value(bool) = .init(false);
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn run(
+            h: *StreamHandler,
+            m: *std.Io.Mutex,
+            d: *termio.Termio.DerivedConfig,
+            flag: *std.atomic.Value(bool),
+        ) void {
+            m.lockUncancelable(std.testing.io);
+            defer m.unlock(std.testing.io);
+            h.changeConfig(d);
+            flag.store(true, .release);
+        }
+    }.run, .{ &handler, &mutex, &derived, &done });
+
+    var returned = false;
+    for (0..200) |_| {
+        if (done.load(.acquire)) {
+            returned = true;
+            break;
+        }
+        try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+    }
+
+    // On failure, free one slot so the blocked thread can finish and join.
+    if (!returned) _ = queue.pop(io);
+    thread.join();
+
+    if (!returned) {
+        std.debug.print("changeConfig was still waiting after 2 s on a full termio mailbox\n", .{});
+    }
+    try testing.expect(returned);
 }
