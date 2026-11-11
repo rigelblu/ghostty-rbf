@@ -426,6 +426,9 @@ pub fn args() std.process.Args {
 ///
 /// Asserts that the global state is initialized.
 pub fn tmpDirPath() []const u8 {
+    // cmux fork (cm-120.2): tests that build a Termio run with no global
+    // state, like the other test fallbacks in this file.
+    if (builtin.is_test and state == null) return "/tmp";
     return state.?.tmp_dir_path.?;
 }
 
