@@ -143,7 +143,13 @@ pub const App = struct {
 
     core_app: *CoreApp,
     opts: Options,
-    keymap: input.Keymap,
+
+    /// The keyboard layout keymap. This is lazily initialized on first
+    /// use because creating it requires talking to the text input
+    /// system (TIS on macOS), and the first such call in a process is
+    /// slow (multiple milliseconds). It is only needed once keyboard
+    /// events start flowing, at which point the system is warm.
+    keymap: ?input.Keymap,
 
     /// The configuration for the app. This is owned by this structure.
     config: Config,
@@ -159,19 +165,16 @@ pub const App = struct {
         var config_clone = try config.clone(alloc);
         errdefer config_clone.deinit();
 
-        var keymap = try input.Keymap.init();
-        errdefer keymap.deinit();
-
         self.* = .{
             .core_app = core_app,
             .config = config_clone,
             .opts = opts,
-            .keymap = keymap,
+            .keymap = null,
         };
     }
 
     pub fn terminate(self: *App) void {
-        self.keymap.deinit();
+        if (self.keymap) |*v| v.deinit();
         self.config.deinit();
     }
 
@@ -231,8 +234,10 @@ pub const App = struct {
 
     /// This should be called whenever the keyboard layout was changed.
     pub fn reloadKeymap(self: *App) !void {
-        // Reload the keymap
-        try self.keymap.reload();
+        // Reload the keymap. If it was never initialized we don't need
+        // to do anything since lazy initialization will pick up the
+        // current layout.
+        if (self.keymap) |*v| try v.reload();
     }
 
     /// Loads the keyboard layout.
@@ -240,13 +245,25 @@ pub const App = struct {
     /// Kind of expensive so this should be avoided if possible. When I say
     /// "kind of expensive" I mean that its not something you probably want
     /// to run on every keypress.
-    pub fn keyboardLayout(self: *const App) input.KeyboardLayout {
+    pub fn keyboardLayout(self: *App) input.KeyboardLayout {
         // We only support keyboard layout detection on macOS.
         if (comptime builtin.os.tag != .macos) return .unknown;
 
+        // Lazily initialize the keymap.
+        const keymap: *input.Keymap = keymap: {
+            if (self.keymap == null) {
+                self.keymap = input.Keymap.init() catch |err| {
+                    log.warn("error initializing keymap err={}", .{err});
+                    return .unknown;
+                };
+            }
+
+            break :keymap &self.keymap.?;
+        };
+
         // Any layout larger than this is not something we can handle.
         var buf: [256]u8 = undefined;
-        const id = self.keymap.sourceId(&buf) catch |err| {
+        const id = keymap.sourceId(&buf) catch |err| {
             comptime assert(@TypeOf(err) == error{OutOfMemory});
             return .unknown;
         };
@@ -2812,6 +2829,45 @@ pub const CAPI = struct {
         };
     }
 
+    /// C ABI mirror of `terminal.Screen.PromptInput` (cmux-specific).
+    pub const PromptInput = extern struct {
+        length: u32 = 0,
+        caret: u32 = 0,
+        has_selection: bool = false,
+        selection_start: u32 = 0,
+        selection_end: u32 = 0,
+    };
+
+    /// Describe the shell input the cursor is editing (cmux-specific).
+    /// Returns false when not at an OSC 133 input prompt on the primary
+    /// screen, in which case `result` is left untouched.
+    export fn ghostty_surface_prompt_input(
+        surface: *Surface,
+        result: *PromptInput,
+    ) bool {
+        const prompt = surface.core_surface.promptInput() orelse return false;
+        result.* = .{ .length = prompt.len, .caret = prompt.caret };
+        if (prompt.selection) |range| {
+            result.has_selection = true;
+            result.selection_start = range.start;
+            result.selection_end = range.end;
+        }
+        return true;
+    }
+
+    /// Select caret stops `[start, end)` of the shell input the cursor is
+    /// editing (cmux-specific). Never writes a clipboard.
+    export fn ghostty_surface_select_prompt_input(
+        surface: *Surface,
+        start: u32,
+        end: u32,
+    ) bool {
+        return surface.core_surface.selectPromptInput(start, end) catch |err| {
+            log.warn("error selecting prompt input err={}", .{err});
+            return false;
+        };
+    }
+
     /// Clear the active selection (cmux-specific).
     export fn ghostty_surface_clear_selection(surface: *Surface) bool {
         return surface.core_surface.clearSelection() catch |err| {
@@ -3420,6 +3476,20 @@ pub const CAPI = struct {
 
     /// Update the size of a surface. This will trigger resize notifications
     /// to the pty and the renderer.
+    /// Install the link filter for regex links under the pointer, or with a
+    /// null callback remove it. See ghostty.h. The embedder keeps userdata
+    /// alive until the filter is removed or ghostty_surface_free returns.
+    export fn ghostty_surface_set_link_filter(
+        surface: *Surface,
+        callback: ?renderer.LinkFilter.Callback,
+        userdata: ?*anyopaque,
+    ) void {
+        surface.core_surface.setLinkFilter(if (callback) |cb| .{
+            .callback = cb,
+            .userdata = userdata,
+        } else null);
+    }
+
     export fn ghostty_surface_set_size(surface: *Surface, w: u32, h: u32) void {
         surface.updateSize(w, h);
     }
@@ -5489,6 +5559,12 @@ pub const CAPI = struct {
     /// enabled.
     export fn ghostty_surface_mouse_captured(surface: *Surface) bool {
         return surface.core_surface.mouseCaptured();
+    }
+
+    /// Returns true if the terminal's active screen is the alternate
+    /// screen (cmux-specific).
+    export fn ghostty_surface_is_alternate_screen(surface: *Surface) bool {
+        return surface.core_surface.isAlternateScreen();
     }
 
     /// Tell the surface that it needs to schedule a render

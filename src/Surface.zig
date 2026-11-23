@@ -930,6 +930,7 @@ pub fn init(
             .size = size,
             .full_config = config,
             .config = try termio.Termio.DerivedConfig.init(alloc, config),
+            .color_scheme = self.config_conditional_state.theme,
             .backend = io_backend,
             .suppress_terminal_responses = if (comptime @hasDecl(apprt.runtime.Surface, "suppressTerminalResponses"))
                 rt_surface.suppressTerminalResponses()
@@ -1458,6 +1459,54 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             ) catch |err| {
                 log.warn("apprt failed to report progress err={}", .{err});
             };
+        },
+
+        .program_status => |v| {
+            defer v.deinit();
+            var id_buf: [129]u8 = undefined;
+            var app_buf: [33]u8 = undefined;
+            var title_buf: [193]u8 = undefined;
+            var msg_buf: [2049]u8 = undefined;
+            const copyCString = struct {
+                fn run(req: ?Message.WriteReq, buf: []u8) ?[]const u8 {
+                    const value = req orelse return null;
+                    const data = value.slice();
+                    if (data.len + 1 > buf.len) return null;
+                    @memcpy(buf[0..data.len], data);
+                    buf[data.len] = 0;
+                    return buf[0..data.len];
+                }
+            }.run;
+            const state: apprt.Action.ProgramStatus.State = switch (v.state) {
+                .idle => .idle,
+                .working => .working,
+                .done => .done,
+                .blocked => .blocked,
+                .@"error" => .@"error",
+                .clear => .clear,
+            };
+            const kind: apprt.Action.ProgramStatus.Kind = if (v.kind) |value| switch (value) {
+                .permission => .permission,
+                .question => .question,
+                .auth => .auth,
+            } else .none;
+            _ = self.rt_app.performAction(
+                .{ .surface = self },
+                .program_status,
+                .{
+                    .event = switch (v.event) {
+                        .report => .report,
+                        .prompt_start => .prompt_start,
+                    },
+                    .state = state,
+                    .kind = kind,
+                    .progress = if (v.progress) |percent| @intCast(percent) else -1,
+                    .id = copyCString(v.id, &id_buf),
+                    .app = copyCString(v.app, &app_buf),
+                    .title = copyCString(v.title, &title_buf),
+                    .msg = copyCString(v.msg, &msg_buf),
+                },
+            ) catch |err| log.warn("apprt failed to report program status err={}", .{err});
         },
 
         .tmux_control => |v| {
@@ -2004,14 +2053,16 @@ fn mouseRefreshLinks(
             mouse_pin,
             mouse_mods,
         );
+        const link_filter = self.renderer_state.link_filter;
         for (0..2) |attempt| {
             self.renderer_state.mutex.unlock(global.io());
-            const resolved_result = linkpkg.resolveAt(
+            const resolved_result = linkpkg.resolveAtFiltered(
                 terminal.Pin,
                 alloc,
                 prepared,
                 self.config.links,
                 mouse_mods,
+                link_filter,
             );
             self.renderer_state.mutex.lockUncancelable(global.io());
 
@@ -2693,6 +2744,34 @@ pub fn selectCursorLine(self: *Surface) !bool {
     }
 
     const sel = screen.selectLine(.{ .pin = pin }) orelse return false;
+    try self.setSelection(sel);
+    screen.dirty.selection = true;
+    try self.queueRender();
+    return true;
+}
+
+/// Describe the shell input the cursor is editing (cmux-specific).
+///
+/// Null unless the terminal is at a prompt on the primary screen and the
+/// cursor is inside an OSC 133 input region. Takes the renderer mutex once;
+/// meant for key gestures, not for every keystroke.
+pub fn promptInput(self: *Surface) ?terminal.Screen.PromptInput {
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
+
+    if (!self.io.terminal.cursorIsAtPrompt()) return null;
+    return self.io.terminal.screens.active.promptInput();
+}
+
+/// Select caret stops `[start, end)` of the shell input the cursor is
+/// editing (cmux-specific). Never writes a clipboard.
+pub fn selectPromptInput(self: *Surface, start: u32, end: u32) !bool {
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
+
+    if (!self.io.terminal.cursorIsAtPrompt()) return false;
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const sel = screen.promptInputSelection(start, end) orelse return false;
     try self.setSelection(sel);
     screen.dirty.selection = true;
     try self.queueRender();
@@ -4432,10 +4511,18 @@ pub fn keyEventIsBinding(
 ) ?input.Binding.Flags {
     const entry = self.keyEventBindingEntry(event_orig) orelse return null;
 
-    return switch (entry.value_ptr.*) {
+    var flags: input.Binding.Flags = switch (entry.value_ptr.*) {
         .leader => .{},
         inline .leaf, .leaf_chained => |v| v.flags,
     };
+
+    // Embedders may preserve predictive local echo only for a binding that
+    // is definitely consumed, non-performable, and has no PTY or grid effect.
+    if (flags.consumed and !flags.performable and entry.value_ptr.*.predictionLocalOnly()) {
+        flags.prediction_local_only = true;
+    }
+
+    return flags;
 }
 
 /// Consume a key event whose corresponding native menu action was unavailable.
@@ -5390,10 +5477,15 @@ pub fn scrollCallback(
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
 
+        // The tracked copy cursor owns wheel navigation for this surface.
+        // Keep the program's DEC modes intact so exiting copy mode restores
+        // its input, and retain Ghostty's normal delta scaling above.
+        const copy_mode = self.keyboard_copy_cursor != null;
+
         // If we have an active mouse reporting mode, clear the selection.
         // The selection can occur if the user uses the shift mod key to
         // override mouse grabbing from the window.
-        if (self.isMouseReporting()) {
+        if (!copy_mode and self.isMouseReporting()) {
             try self.setSelection(null);
         }
 
@@ -5401,7 +5493,8 @@ pub fn scrollCallback(
         // we convert to cursor keys. This only happens if we're:
         // (1) alt screen (2) no explicit mouse reporting and (3) alt
         // scroll mode enabled.
-        if (self.io.terminal.screens.active_key == .alternate and
+        if (!copy_mode and
+            self.io.terminal.screens.active_key == .alternate and
             self.io.terminal.flags.mouse_event == .none and
             self.io.terminal.modes.get(.mouse_alternate_scroll))
         {
@@ -5436,7 +5529,7 @@ pub fn scrollCallback(
         // the normal logic.
 
         // If we're scrolling up or down, then send a mouse event.
-        if (self.isMouseReporting()) {
+        if (!copy_mode and self.isMouseReporting()) {
             for (0..@abs(y.delta)) |_| {
                 const pos = try self.rt_surface.getCursorPos();
                 self.mouseReport(switch (y.direction()) {
@@ -5642,6 +5735,14 @@ pub fn mouseCaptured(self: *Surface) bool {
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
     return self.io.terminal.flags.mouse_event != .none;
+}
+
+/// Returns true if the terminal's active screen is the alternate screen
+/// (e.g. a full-screen TUI such as vim, less, or htop is running).
+pub fn isAlternateScreen(self: *Surface) bool {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    return self.io.terminal.screens.active_key == .alternate;
 }
 
 /// Called for mouse button press/release events. This will return true
@@ -6361,6 +6462,18 @@ test "link snapshot validation retries once and detects exact changes" {
 /// Returns the link at the given cursor position, if any.
 ///
 /// Requires the renderer mutex is held.
+/// Installs the embedder's link filter, or with null removes it
+/// (`ghostty_surface_set_link_filter`). The renderer reads it on its next frame.
+pub fn setLinkFilter(self: *Surface, filter: ?rendererpkg.LinkFilter) void {
+    {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        self.renderer_state.link_filter = filter;
+        self.renderer_state.terminal.screens.active.dirty.hyperlink_hover = true;
+    }
+    self.queueRender() catch |err| log.warn("error queueing render after link filter change err={}", .{err});
+}
+
 fn linkAtPos(
     self: *Surface,
     pos: apprt.CursorPos,
@@ -6393,6 +6506,7 @@ fn linkAtPos(
         self.config.links,
         mouse_pin,
         mouse_mods,
+        self.renderer_state.link_filter,
     );
 }
 
@@ -6448,6 +6562,7 @@ fn linkAtScreenPinWithOsc8(
     links: []const DerivedConfig.Link,
     mouse_pin: terminal.Pin,
     mouse_mods: input.Mods,
+    filter: ?linkpkg.Filter,
 ) !?Link {
     if (mouse_mods.equal(input.ctrlOrSuper(.{}))) {
         if (osc8URI(mouse_pin)) |uri| return .{
@@ -6456,7 +6571,7 @@ fn linkAtScreenPinWithOsc8(
             .value = try alloc.dupeZ(u8, uri),
         };
     }
-    return try linkAtScreenPin(alloc, screen, links, mouse_pin, mouse_mods);
+    return try linkAtScreenPinFiltered(alloc, screen, links, mouse_pin, mouse_mods, filter);
 }
 
 /// Resolve an explicit context-menu target: OSC 8 first, then every configured
@@ -6485,6 +6600,18 @@ fn linkAtScreenPin(
     mouse_pin: terminal.Pin,
     mouse_mods: ?input.Mods,
 ) !?Link {
+    return linkAtScreenPinFiltered(alloc, screen, links, mouse_pin, mouse_mods, null);
+}
+
+/// `linkAtScreenPin`, where a link the embedder's filter rejects is no link.
+fn linkAtScreenPinFiltered(
+    alloc: Allocator,
+    screen: *terminal.Screen,
+    links: []const DerivedConfig.Link,
+    mouse_pin: terminal.Pin,
+    mouse_mods: ?input.Mods,
+    filter: ?linkpkg.Filter,
+) !?Link {
     if (links.len == 0) return null;
     var arena = ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -6497,12 +6624,13 @@ fn linkAtScreenPin(
         mouse_pin,
         mouse_mods,
     );
-    const resolved = (try linkpkg.resolveAt(
+    const resolved = (try linkpkg.resolveAtFiltered(
         terminal.Pin,
         arena_alloc,
         prepared,
         links,
         mouse_mods,
+        filter,
     )) orelse return null;
 
     const value = try alloc.dupeZ(u8, resolved.value);
@@ -6880,6 +7008,9 @@ pub fn colorSchemeCallback(self: *Surface, scheme: apprt.ColorScheme) !void {
 
     // Setup our conditional state which has the current color theme.
     self.config_conditional_state.theme = new_scheme;
+    // Reports must follow the surface even if a plain config has no conditional
+    // theme to reload, or the embedder coalesces the reload notification.
+    self.io.updateColorScheme(new_scheme);
     self.notifyConfigConditionalState();
 
     // If mode 2031 is on, then we report the change live.
@@ -7856,7 +7987,8 @@ fn writeScreenFile(
 ) !void {
     // Create a temporary directory to store our scrollback.
     var tmp_dir = try internal_os.TempDir.init();
-    errdefer tmp_dir.deinit();
+    var retain_tmp_dir = false;
+    defer if (retain_tmp_dir) tmp_dir.close(.retain) else tmp_dir.deinit();
 
     var filename_buf: [std.fs.max_path_bytes]u8 = undefined;
     const filename = try std.fmt.bufPrint(
@@ -7935,7 +8067,6 @@ fn writeScreenFile(
 
         const sel = sel_ orelse {
             // If we have no selection we have no data so we do nothing.
-            tmp_dir.deinit();
             return;
         };
 
@@ -7994,6 +8125,9 @@ fn writeScreenFile(
             path,
         ), .unlocked),
     }
+
+    // The action accepted the path, so retain the file for its consumer.
+    retain_tmp_dir = true;
 }
 
 /// Call this to complete a clipboard request sent to apprt. This should
@@ -9958,6 +10092,7 @@ test "Surface: OSC 8 owns an overlapping regex link target" {
         derived.links,
         pin,
         input.ctrlOrSuper(.{}),
+        null,
     )) orelse return error.TestExpectedEqual;
     defer link.deinit(alloc);
     try testing.expectEqual(input.Link.Action._open_osc8, std.meta.activeTag(link.action));

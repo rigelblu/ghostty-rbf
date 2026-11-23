@@ -44,6 +44,10 @@ backend: termio.Backend,
 /// The derived configuration for this termio implementation.
 config: DerivedConfig,
 
+/// Runtime scheme used by CSI 996 queries and mode 2031 reports. Guarded by
+/// renderer_state.mutex; config swaps must never overwrite appearance state.
+color_scheme: configpkg.ConditionalState.Theme,
+
 /// The terminal emulator internal state. This is the abstract "terminal"
 /// that manages input, grid updating, etc. and is renderer-agnostic. It
 /// just stores internal state about a grid.
@@ -149,13 +153,15 @@ const ThreadEnterState = struct {
     ) (Allocator.Error || error{InputNotFound})![]const Input {
         const alloc = self.arena.allocator();
 
-        var input = try alloc.alloc(
-            Input,
+        var inputs: std.ArrayList(Input) = try .initCapacity(
+            alloc,
             self.input.list.items.len,
         );
-        for (self.input.list.items, 0..) |item, i| {
-            input[i] = switch (item) {
-                .raw => |v| .{ .string = try alloc.dupe(u8, v) },
+        errdefer for (inputs.items) |item| item.deinit();
+
+        for (self.input.list.items) |item| {
+            inputs.appendAssumeCapacity(switch (item) {
+                .raw => |v| .{ .string = v },
                 .path => |path| file: {
                     const f = std.Io.Dir.cwd().openFile(
                         global.io(),
@@ -171,15 +177,22 @@ const ThreadEnterState = struct {
 
                     break :file .{ .file = f };
                 },
-            };
+            });
         }
 
-        return input;
+        return inputs.items;
     }
 
     const Input = union(enum) {
         string: []const u8,
         file: std.Io.File,
+
+        fn deinit(self: Input) void {
+            switch (self) {
+                .string => {},
+                .file => |f| f.close(global.io()),
+            }
+        }
     };
 };
 
@@ -200,7 +213,6 @@ pub const DerivedConfig = struct {
     osc_color_report_format: configpkg.Config.OSCColorReportFormat,
     clipboard_write: configpkg.ClipboardAccess,
     enquiry_response: []const u8,
-    conditional_state: configpkg.ConditionalState,
 
     pub fn init(
         alloc_gpa: Allocator,
@@ -240,7 +252,6 @@ pub const DerivedConfig = struct {
             .osc_color_report_format = config.@"osc-color-report-format",
             .clipboard_write = config.@"clipboard-write",
             .enquiry_response = try alloc.dupe(u8, config.@"enquiry-response"),
-            .conditional_state = config._conditional_state,
 
             // This has to be last so that we copy AFTER the arena allocations
             // above happen (Zig assigns in order).
@@ -365,6 +376,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .alloc = alloc,
         .terminal = term,
         .config = opts.config,
+        .color_scheme = opts.color_scheme,
         .renderer_state = opts.renderer_state,
         .renderer_wakeup = opts.renderer_wakeup,
         .renderer_mailbox = opts.renderer_mailbox,
@@ -411,6 +423,9 @@ pub fn threadEnter(
         try v.prepareInput()
     else
         null;
+    defer if (inputs) |items| {
+        for (items) |input| input.deinit();
+    };
 
     data.* = .{
         .alloc = self.alloc,
@@ -431,20 +446,21 @@ pub fn threadEnter(
             log.warn("failed to queue input string err={}", .{err});
             return error.InputFailed;
         },
-        .file => |f| self.queueWrite(
-            data,
-            compat_file.readToEndAlloc(
+        .file => |f| {
+            const contents = compat_file.readToEndAlloc(
                 f,
                 self.alloc,
                 10 * 1024 * 1024, // 10 MiB max
             ) catch |err| {
                 log.warn("failed to read input file err={}", .{err});
                 return error.InputFailed;
-            },
-            false,
-        ) catch |err| {
-            log.warn("failed to queue input file err={}", .{err});
-            return error.InputFailed;
+            };
+            defer self.alloc.free(contents);
+
+            self.queueWrite(data, contents, false) catch |err| {
+                log.warn("failed to queue input file err={}", .{err});
+                return error.InputFailed;
+            };
         },
     };
 }
@@ -620,6 +636,14 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
     };
 }
 
+/// Update report state synchronously with the surface appearance callback.
+/// The IO thread reads it under the same lock when it handles a queued query.
+pub fn updateColorScheme(self: *Termio, scheme: configpkg.ConditionalState.Theme) void {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    self.color_scheme = scheme;
+}
+
 /// Update only the terminal color defaults used by OSC resets.
 ///
 /// Manual-IO embedders call this on the same serial executor as processOutput.
@@ -747,58 +771,19 @@ pub fn resetSynchronizedOutput(self: *Termio) void {
 
 /// Clear the screen.
 pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
-    {
+    const at_prompt: bool = at_prompt: {
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
 
-        // If we're on the alternate screen, we do not clear. Since this is an
-        // emulator-level screen clear, this messes up the running programs
-        // knowledge of where the cursor is and causes rendering issues. So,
-        // for alt screen, we do nothing.
-        if (self.terminal.screens.active_key == .alternate) return;
+        // The terminal owns the whole clear (alternate screen no-op,
+        // prompt detection, erase ordering, history). It tells us whether
+        // the cursor was at a prompt, in which case the shell must repaint.
+        break :at_prompt self.terminal.clearScreen(history);
+    };
 
-        // Clear our selection
-        self.terminal.screens.active.clearSelection();
-
-        // Clear our scrollback
-        if (history) self.terminal.eraseDisplay(.scrollback, false);
-
-        // If we're not at a prompt, we just delete above the cursor.
-        if (!self.terminal.cursorIsAtPrompt()) {
-            if (self.terminal.screens.active.cursor.y > 0) {
-                self.terminal.screens.active.eraseActive(
-                    self.terminal.screens.active.cursor.y - 1,
-                );
-            }
-
-            // Clear all Kitty graphics state for this screen. This copies
-            // Kitty's behavior when Cmd+K deletes all Kitty graphics. I
-            // didn't spend time researching whether it only deletes Kitty
-            // graphics that are placed above the cursor or if it deletes
-            // all of them. We delete all of them for now but if this behavior
-            // isn't fully correct we should fix this later.
-            self.terminal.screens.active.kitty_images.delete(
-                self.terminal.io(),
-                self.terminal.screens.active.alloc,
-                &self.terminal,
-                .{ .all = true },
-            );
-
-            return;
-        }
-
-        // At a prompt, we want to first fully clear the screen, and then after
-        // send a FF (0x0C) to the shell so that it can repaint the screen.
-        // Mark the current row as a not a prompt so we can properly
-        // clear the full screen in the next eraseDisplay call.
-        // TODO: fix this
-        // self.terminal.markSemanticPrompt(.command);
-        // assert(!self.terminal.cursorIsAtPrompt());
-        self.terminal.eraseDisplay(.complete, false);
-    }
-
-    // If we reached here it means we're at a prompt, so we send a form-feed.
-    try self.queueWrite(td, &[_]u8{0x0C}, false);
+    // At a prompt the screen is now fully cleared, so send a form-feed
+    // (0x0C) to the shell so that it can repaint the prompt.
+    if (at_prompt) try self.queueWrite(td, &[_]u8{0x0C}, false);
 }
 
 /// Scroll the viewport
@@ -1006,7 +991,7 @@ pub fn colorSchemeReportLocked(self: *Termio, td: *ThreadData, force: bool) !voi
     if (!force and !self.renderer_state.terminal.modes.get(.report_color_scheme)) {
         return;
     }
-    const scheme: terminalpkg.device_status.ColorScheme = switch (self.config.conditional_state.theme) {
+    const scheme: terminalpkg.device_status.ColorScheme = switch (self.color_scheme) {
         .light => .light,
         .dark => .dark,
     };
@@ -1057,8 +1042,8 @@ pub fn getProcessInfo(self: *Termio, comptime info: ProcessInfo) ?ProcessInfo.Ty
 // cm-120.2: changeConfig writes the mode 2031 report itself instead of
 // queueing it into the termio mailbox, which only the IO thread drains. A
 // program that turned on mode 2031 must still get exactly one report, with
-// the new theme, and nothing may be left in the mailbox.
-test "changeConfig writes one mode 2031 report with the new theme and queues none" {
+// the surface's current scheme, and nothing may be left in the mailbox.
+test "changeConfig writes one mode 2031 report and queues none" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
@@ -1078,11 +1063,6 @@ test "changeConfig writes one mode 2031 report with the new theme and queues non
     var mutex: std.Io.Mutex = .init;
     var renderer_state: renderer.State = .{ .mutex = &mutex, .terminal = undefined };
 
-    // The terminal starts dark, so a report built from the old config would
-    // say dark (;1n) and fail the light (;2n) check below.
-    var initial = try DerivedConfig.init(alloc, &full_config);
-    initial.conditional_state.theme = .dark;
-
     var t: Termio = undefined;
     try t.init(alloc, .{
         .size = .{
@@ -1091,7 +1071,8 @@ test "changeConfig writes one mode 2031 report with the new theme and queues non
             .padding = .{},
         },
         .full_config = &full_config,
-        .config = initial,
+        .config = try DerivedConfig.init(alloc, &full_config),
+        .color_scheme = .dark,
         .backend = .{ .manual = manual },
         .mailbox = try termio.Mailbox.initSPSC(alloc),
         .renderer_state = &renderer_state,
@@ -1111,10 +1092,11 @@ test "changeConfig writes one mode 2031 report with the new theme and queues non
         .mailbox = &t.mailbox,
     };
 
-    // A program turns on mode 2031, then the theme changes from dark to light.
+    // A program turns on mode 2031, then the surface switches from dark to
+    // light and the config is reloaded.
     t.terminal.modes.set(.report_color_scheme, true);
+    t.updateColorScheme(.light);
     var light = try DerivedConfig.init(alloc, &full_config);
-    light.conditional_state.theme = .light;
     try t.changeConfig(&td, &light); // t owns light's arena from here
     try testing.expectEqualStrings("\x1B[?997;2n", out.items);
     try testing.expectEqual(0, t.mailbox.spsc.queue.count(testing.io));
@@ -1122,8 +1104,8 @@ test "changeConfig writes one mode 2031 report with the new theme and queues non
     // With mode 2031 off, a config change writes nothing.
     out.clearRetainingCapacity();
     t.terminal.modes.set(.report_color_scheme, false);
+    t.updateColorScheme(.dark);
     var dark = try DerivedConfig.init(alloc, &full_config);
-    dark.conditional_state.theme = .dark;
     try t.changeConfig(&td, &dark);
     try testing.expectEqualStrings("", out.items);
     try testing.expectEqual(0, t.mailbox.spsc.queue.count(testing.io));
