@@ -3495,8 +3495,8 @@ test "terminal-unit page metadata zeroes on reuse and clone slots do not alias" 
     defer page.deinit();
     const rows = page.rows.ptr(page.memory);
 
-    try page.setTerminalUnit(&rows[0], 11, "/work/source");
-    try page.setTerminalUnit(&rows[1], 22, "/work/destination");
+    try page.setTerminalUnit(&rows[0], 11, "/work/source", null);
+    try page.setTerminalUnit(&rows[1], 22, "/work/destination", null);
 
     // A partial row clone preserves the destination row's marker rather than
     // copying or aliasing the source marker slot.
