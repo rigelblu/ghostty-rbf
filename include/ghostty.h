@@ -146,6 +146,8 @@ typedef enum {
   GHOSTTY_BINDING_FLAGS_ALL = 1 << 1,
   GHOSTTY_BINDING_FLAGS_GLOBAL = 1 << 2,
   GHOSTTY_BINDING_FLAGS_PERFORMABLE = 1 << 3,
+  // The binding is consumed locally and emits no PTY bytes or grid changes.
+  GHOSTTY_BINDING_FLAGS_PREDICTION_LOCAL_ONLY = 1 << 4,
 } ghostty_binding_flags_e;
 
 typedef enum {
@@ -1162,6 +1164,41 @@ typedef struct {
   int8_t progress;
 } ghostty_action_progress_report_s;
 
+typedef enum {
+  GHOSTTY_PROGRAM_STATUS_EVENT_REPORT,
+  GHOSTTY_PROGRAM_STATUS_EVENT_PROMPT_START,
+} ghostty_program_status_event_e;
+
+typedef enum {
+  GHOSTTY_PROGRAM_STATUS_IDLE,
+  GHOSTTY_PROGRAM_STATUS_WORKING,
+  GHOSTTY_PROGRAM_STATUS_DONE,
+  GHOSTTY_PROGRAM_STATUS_BLOCKED,
+  GHOSTTY_PROGRAM_STATUS_ERROR,
+  GHOSTTY_PROGRAM_STATUS_CLEAR,
+} ghostty_program_status_state_e;
+
+typedef enum {
+  GHOSTTY_PROGRAM_STATUS_KIND_NONE,
+  GHOSTTY_PROGRAM_STATUS_KIND_PERMISSION,
+  GHOSTTY_PROGRAM_STATUS_KIND_QUESTION,
+  GHOSTTY_PROGRAM_STATUS_KIND_AUTH,
+} ghostty_program_status_kind_e;
+
+// apprt.Action.ProgramStatus.C
+// String pointers are borrowed and valid only for the duration of the action
+// callback. They are NUL-terminated when non-NULL.
+typedef struct {
+  ghostty_program_status_event_e event;
+  ghostty_program_status_state_e state;
+  ghostty_program_status_kind_e kind;
+  int8_t progress;
+  const char* id;
+  const char* app;
+  const char* title;
+  const char* msg;
+} ghostty_action_program_status_s;
+
 // apprt.action.CommandFinished.C
 typedef struct {
   // -1 if no exit code was reported, otherwise 0-255
@@ -1261,6 +1298,7 @@ typedef enum {
   GHOSTTY_ACTION_READONLY,
   GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD,
   GHOSTTY_ACTION_SELECTION_CHANGED,
+  GHOSTTY_ACTION_PROGRAM_STATUS,
   GHOSTTY_ACTION_TERMINAL_UNITS_CHANGED,
 } ghostty_action_tag_e;
 
@@ -1303,6 +1341,7 @@ typedef union {
   ghostty_action_search_total_s search_total;
   ghostty_action_search_selected_s search_selected;
   ghostty_action_readonly_e readonly;
+  ghostty_action_program_status_s program_status;
 } ghostty_action_u;
 
 typedef struct {
@@ -1310,6 +1349,16 @@ typedef struct {
   ghostty_action_u action;
 } ghostty_action_s;
 
+// Whether `len` bytes of `text` (not NUL-terminated), a regex link under the
+// pointer, are a link. False: no hover underline, no pointer change, no
+// mouse-over-link and no open. OSC 8 links and always-highlighted links are
+// not asked. Called on the renderer thread and on the app thread, sometimes
+// with the terminal lock held, so it answers from what it already knows and
+// never calls into Ghostty; to change an answer, the embedder sends the
+// pointer position again (ghostty_surface_mouse_pos) or refreshes.
+typedef bool (*ghostty_surface_link_filter_cb)(void* userdata,
+                                               const char* text,
+                                               uintptr_t len);
 typedef void (*ghostty_runtime_wakeup_cb)(void*);
 typedef bool (*ghostty_runtime_read_clipboard_cb)(void*,
                                                   ghostty_clipboard_e,
@@ -1521,6 +1570,12 @@ GHOSTTY_API bool ghostty_surface_request_render_with_token(ghostty_surface_t,
 GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
 GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
+// Installs the link filter for this surface; a NULL callback removes it.
+// userdata must stay valid until the filter is removed or
+// ghostty_surface_free returns.
+GHOSTTY_API void ghostty_surface_set_link_filter(ghostty_surface_t,
+                                                 ghostty_surface_link_filter_cb,
+                                                 void* userdata);
 GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
 // cmux fork: reserve extra drawable pixels above and below the padded grid
 // for render-only scrollback overscan (the iOS scroll-edge-effect bands
@@ -1742,6 +1797,9 @@ GHOSTTY_API void ghostty_surface_set_pty_tee_cb(ghostty_surface_t,
                                                 void* userdata);
 
 GHOSTTY_API bool ghostty_surface_mouse_captured(ghostty_surface_t);
+// cmux fork: true when the terminal's active screen is the alternate screen.
+// Takes the renderer state mutex, same as ghostty_surface_mouse_captured.
+GHOSTTY_API bool ghostty_surface_is_alternate_screen(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_mouse_button(ghostty_surface_t,
                                                  ghostty_input_mouse_state_e,
                                                  ghostty_input_mouse_button_e,
@@ -1776,6 +1834,30 @@ GHOSTTY_API bool ghostty_surface_has_selection(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_select_cursor_cell(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_select_cursor_line(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_clear_selection(ghostty_surface_t);
+// cmux fork: the shell input (OSC 133 B region) the cursor is editing.
+// Offsets count caret stops: input cells holding text, wide-character spacers
+// skipped, over the cursor's soft-wrapped line only (a hard newline in a
+// multi-line buffer ends the region). Each stop is one Left/Right arrow step
+// for zle/readline. ghostty_surface_prompt_input returns false, leaving the
+// struct untouched, unless the terminal is at a prompt on the primary screen
+// and the cursor's line shows a prompt before its input; a line holding a
+// multi-codepoint grapheme is also refused. Text a line editor draws after the
+// buffer in input mode (zsh-autosuggestions) counts as input. The selection
+// fields are set only when the active selection lies wholly within the input.
+// ghostty_surface_select_prompt_input selects stops [start, end) without
+// writing a clipboard.
+typedef struct {
+  uint32_t length;
+  uint32_t caret;
+  bool has_selection;
+  uint32_t selection_start;
+  uint32_t selection_end;
+} ghostty_surface_prompt_input_s;
+GHOSTTY_API bool ghostty_surface_prompt_input(ghostty_surface_t,
+                                              ghostty_surface_prompt_input_s*);
+GHOSTTY_API bool ghostty_surface_select_prompt_input(ghostty_surface_t,
+                                                     uint32_t,
+                                                     uint32_t);
 // cmux fork: tracked keyboard-selection operations in viewport coordinates.
 // These avoid synthesizing mouse gestures and keep terminal row identity,
 // selection motion, rendering, and clipboard formatting inside Ghostty.
